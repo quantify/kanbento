@@ -1,0 +1,8 @@
+{
+  "manifestVersion": "1.0",
+  "board": { "id": "demo", "name": "Demo Pool", "revision": 0, "maturity": "pool" },
+  "inbox": { "sources": ["human", "agent", "ingest"], "landing": "backlog", "shape": "raw" },
+  "stages": [{ "id": "backlog", "role": "options" }],
+  "policies": { "joining": "A worker announces its capability profile on arrival." },
+  "cardSchema": { "core": ["id", "title", "state", "createdAt", "updatedAt"], "types": "open" }
+}

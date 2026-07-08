@@ -1,0 +1,31 @@
+{
+  "manifestVersion": "1.0",
+  "board": { "id": "sdlc-demo", "name": "SDLC (demo)", "revision": 1, "maturity": "standard" },
+  "inbox": { "sources": ["human", "agent", "ingest"], "landing": "backlog", "shape": "raw" },
+  "stages": [
+    { "id": "backlog", "role": "options" },
+    {
+      "id": "ready",
+      "role": "commit",
+      "wip": 2,
+      "entry": {
+        "enforcement": "strict",
+        "statement": "Commit when acceptance criteria are defined, the card is estimated, and capacity exists.",
+        "rule": { "all": ["acceptanceCriteriaDefined", "estimated", "capacityAvailable"] }
+      }
+    },
+    { "id": "in_progress", "role": "active", "wip": 2 },
+    { "id": "review", "role": "loop", "wip": 2 },
+    {
+      "id": "done",
+      "role": "done",
+      "entry": { "enforcement": "advisory", "statement": "Delivered when reviewed, verified, and shipped." }
+    }
+  ],
+  "flows": [
+    { "from": "review", "to": "in_progress", "kind": "loop", "trigger": ["changesRequested"], "maxIterations": 2 },
+    { "from": "backlog", "to": "in_progress", "kind": "skip", "appliesTo": { "classOfService": "expedite" } }
+  ],
+  "policies": { "wip": { "enforcement": "strict", "scope": ["stage"] } },
+  "cardSchema": { "core": ["id", "title", "type", "state", "createdAt", "updatedAt"], "types": ["story", "bug"] }
+}
