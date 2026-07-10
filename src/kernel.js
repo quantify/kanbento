@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { dirname, resolve as pathResolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
-import { slugify, titleSlug } from './slug.js';
+import { slugify, titleSlug, explicitSlug } from './slug.js';
 import {
   loadManifest,
   inboxLanding,
@@ -23,6 +23,10 @@ import { dispositionForRole } from './protocol.js';
 import { checkRelationStrict, refEdges, parseCurie, resolveRelKey, expandedRelations } from './refs.js';
 import { matchingHooks, runEvaluator, agreementHooks, execCommand, stageContract } from './hooks.js';
 import { compile, diffCompiled, isEmptyChangeset, reconcileMoves } from './compile.js';
+
+// Board context derivation lives in boards.js (with resolution + the registry it reads);
+// re-exported here so it sits on the kernel's public surface — a transport asks the kernel.
+export { boardEnv } from './boards.js';
 
 const DEFAULT_INVOKER = 'claude -p "$KANBENTO_PROMPT"'; // the run engine's doer; pluggable via manifest.runInvoker
 const WORKTREE_CAP = 100; // max stamped paths per event; the rest fold into an overflow count
@@ -189,6 +193,21 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
 
   // --- capture ---------------------------------------------------------------
 
+  // Defense in depth at the kernel seam. A card's slug becomes a filesystem path
+  // via the type's path template, so a slug from ANY programmatic caller (not just
+  // the CLI, whose explicitSlug already sanitizes) must never carry a path
+  // separator, a `..` traversal, a leading dot, or a pathological length. Reject
+  // loudly here — the kernel never writes a path from an unvetted slug. Cheap by
+  // design: CLI users never trip it (their slug is already sanitized); this guards
+  // non-CLI callers. Returns the slug for chaining.
+  function assertSafeSlug(slug) {
+    const s = String(slug ?? '');
+    if (/[/\\]/.test(s) || s.includes('..') || s.startsWith('.') || s.length > 128) {
+      throw new Error(`slug "${s}" is unsafe — no path separators, "..", leading ".", or over 128 chars`);
+    }
+    return s;
+  }
+
   async function capture({ id, source, body, title, type, from, path, idempotencyKey, lane, payload, slug } = {}) {
     if (!source) throw new Error('capture: `source` is required (e.g. "agent:flow-finder")');
     if (!body || !body.trim()) throw new Error('capture: `body` is required (free text)');
@@ -257,7 +276,10 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
       landing: inboxLanding(manifest),
       // The human handle: minted here so it is immutable in the log (immune to
       // later title edits). Absent -> projectCaptured derives one from the body.
-      ...(slug ? { slug: slugify(slug) } : {}),
+      // An explicit slug is the operator's word: reject an unsafe one loudly,
+      // then sanitize the charset WITHOUT capping (explicitSlug, not slugify) —
+      // silently shortening it would corrupt the chosen handle.
+      ...(slug ? { slug: explicitSlug(assertSafeSlug(slug)) } : {}),
       ...(type != null ? { cardType: type } : {}),
       ...(parent ? { parent } : {}),
       // born tracked: link the card to the artifact capture materializes (the
@@ -476,7 +498,9 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
     const card = resolveCard(rebuild(events), cardRef);
     if (!card) throw new Error(`reslug: card "${cardRef}" not found`);
     if (card.archived) return card; // frozen — the handle is settled; advisory reslug is a no-op
-    newSlug = slugify(String(newSlug ?? ''), 48);
+    assertSafeSlug(newSlug); // defense in depth: a reslug renames a path, so reject an unvetted programmatic slug
+    newSlug = slugify(String(newSlug ?? ''), 48); // a model-derived slug stays capped; slugify also neutralizes charset
+
     if (!newSlug || newSlug === 'untitled' || newSlug === card.slug) return card;
     const event = { type: 'CardSlugged', eventId: randomUUID(), cardId: card.id, at: now(), by, slug: newSlug, ...(path ? { path } : {}), ...causeFromEnv() };
     await log.append(event);

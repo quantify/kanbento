@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import { join, resolve, basename, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { existsSync, statSync, readdirSync, readFileSync, appendFileSync } from 'node:fs';
 import { mkdir, writeFile, copyFile, readFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { openBoard } from './kernel.js';
 import { FileLog } from './eventlog.js';
-import { resolveBoardDir, resolveInitTarget, manifestPathIn, dataDirIn, hasManifest, repoRoot, registerBoard, gitObserver, gitIdentity } from './boards.js';
+import { resolveBoardDir, resolveInitTarget, manifestPathIn, dataDirIn, hasManifest, repoRoot, registerBoard, gitObserver, gitIdentity, homeConfig } from './boards.js';
 import { compile, diffCompiled, isEmptyChangeset, reconcileMoves } from './compile.js';
 import { indexRecords, indexDocs } from './binding.js';
 import { forwardEdges, collectBacklinks, neighborhood, parseCurie, refEdges, collectFrontier, stageProcedurePath, stageAgreementPath, presentIncoming } from './refs.js';
@@ -27,6 +27,7 @@ import { loadManifest, mergeManifests, typeDef, vocabTerms, embodiedTypes, recor
 import { discoverBoards, deriveRoster, discoverNetworks, anchorOf } from './network.js';
 import { retain as retainCase, taxonomy as caseTaxonomy } from './cases.js';
 import { captureCard, noteCard, elaborateCard, reaffirmCard, applyReslug, syncBoard, parseLane, mergeRefs, linkRefs, unlinkRefs, resolvePiece, listSkills, assembleProcedure, revisedStale } from './commands.js';
+import { registerSchedule, removeSchedule, annotateSchedules, fireSchedule, grantSummary } from './schedule.js';
 
 // Advertise this entrypoint so hook handlers can call verbs back (the board
 // reacting to itself). Inherited by spawned handlers via the environment.
@@ -132,11 +133,20 @@ program
   .argument('[target]', '@name or <dir> for the board (default: cwd)')
   .summary('create a board (manifest + guide + root anchors)')
   .option('--from <manifest>', 'seed the manifest from a file')
+  .option('--template <n>', 'stage ladder 2..5 (default 4); enumerated below')
   .option('--id <id>', 'board id (else derived from the target dir; overrides a --from seed\'s identity)')
   .option('--name <name>', 'board display name (defaults to the id)')
+  .addHelpText('after', () => {
+    const w = Math.max(...Object.values(TEMPLATES).map((t) => t.chain.length));
+    const lines = ['', 'Templates (--template <n>; default 4 — the 4-stage board):'];
+    for (const [n, t] of Object.entries(TEMPLATES)) lines.push(`  ${n}  ${t.chain.padEnd(w)}   ${t.blurb}`);
+    return lines.join('\n');
+  })
   .action(async (target, opts) => {
+    if (opts.from && opts.template != null) throw new Error('init: pass --from OR --template, not both');
+    const template = opts.template != null ? resolveTemplate(opts.template) : null;
     const { dir, label } = resolveInitTarget(target ?? program.opts().board);
-    await initBoard(dir, label, opts.from, { id: opts.id, name: opts.name });
+    await initBoard(dir, label, opts.from, { id: opts.id, name: opts.name }, template);
   });
 
 program
@@ -318,9 +328,21 @@ program
   .argument('<ref>', 'card handle slug@id, or a bare id, slug, CURIE, or unique prefix')
   .summary('print one card as JSON')
   .action(async (ref) => {
-    const { board } = await openCtx();
+    const { board, dir } = await openCtx();
     const c = await board.card(ref);
-    console.log(c ? JSON.stringify(c, null, 2) : `(no card matching "${ref}")`);
+    // presentation-only: a clickable link for this card. linkScheme config picks
+    // who opens any knowledge piece — the viewer (kanbento://) or the OS default
+    // app (file://, bound pieces only: nothing on disk means nothing to open).
+    let link;
+    if (c) {
+      if (homeConfig().linkScheme === 'file') {
+        if (c.binding?.path) link = pathToFileURL(join(dir, c.binding.path)).href;
+      } else {
+        link = `kanbento://${c.slug}@${c.id.slice(0, 8)}`;
+      }
+    }
+    const out = c && (link ? { ...c, link } : c);
+    console.log(out ? JSON.stringify(out, null, 2) : `(no card matching "${ref}")`);
   });
 
 program
@@ -433,8 +455,12 @@ program
     const { board, dir } = await openCtx();
     const skills = await listSkills({ board, dir });
     if (!skills.length) return void console.log('no procedures — author one with `kanbento note --type procedure`');
-    for (const s of skills)
-      console.log(`${s.curie}${s.status ? ` · ${s.status}` : ''}${s.builtin ? ' · builtin' : ''} · ${lastRanLabel(s.lastRan)}${s.due ? ' · DUE' : ''}`);
+    for (const s of skills) {
+      // One clock: last-ran is the ProcedureInvoked fold above (a scheduled fire now witnesses
+      // it too), so the ⏰ marker carries only the rhythm, not a second, contradictable stamp.
+      const sched = s.schedule ? ` · ⏰ daily ${s.schedule.at}` : '';
+      console.log(`${s.curie}${s.status ? ` · ${s.status}` : ''}${s.builtin ? ' · builtin' : ''} · ${lastRanLabel(s.lastRan)}${s.due ? ' · DUE' : ''}${sched}`);
+    }
     console.log(`\n${skills.length} procedure(s) — run one with: kanbento do <name>`);
   });
 
@@ -450,6 +476,61 @@ program
     // Execution is presumed; abandonment is the exception, not the modeled case.
     if (record.curie) await board.procedureInvoked(record.curie);
     process.stdout.write(text);
+  });
+
+program
+  .command('schedule')
+  .argument('[procedure]', 'procedure to schedule (slug or CURIE); omit to list current schedules')
+  .summary("project a procedure's cadence into the OS scheduler (launchd); --fire is the scheduled entry point (guard + headless agent run, halts at the consent gate)")
+  .option('--at <HH:MM>', 'time of day to fire (default 09:00)')
+  .option('--remove', 'deregister the schedule')
+  .option('--fire', 'the scheduled entry point — guard, then run the routine headless (invoked by launchd)')
+  .action(async (procedure, opts) => {
+    if (opts.fire) {
+      // launchd invokes jobs with cwd `/` — no board is resolvable there. The plist passes the
+      // fire key (the state file's own basename), so the fire locates its board-qualified state
+      // and runs in the owning board root (read from that state). A human firing a bare slug from
+      // inside a board gets a best-effort boardId so the qualified state still resolves.
+      if (!procedure) throw new Error('schedule --fire: a procedure is required');
+      let boardId = null;
+      try { const { board } = await openCtx(); boardId = board.manifest?.board?.id ?? null; }
+      catch { /* launchd fires from / — no board there */ }
+      const res = await fireSchedule({}, procedure, { boardId });
+      if (res.skipped) console.log(`${res.slug}: ${res.reason}`);
+      else if (res.failed && !res.ran) { console.error(`${res.slug}: ${res.reason}`); process.exitCode = 1; }
+      else if (!res.ran) console.log(`${res.slug}: ${res.reason}`);
+      else if (res.failed) { console.error(`${res.slug}: run failed (exit ${res.exitCode}) — lastRun untouched`); process.exitCode = 1; }
+      else console.log(`${res.slug}: ran — lastRun stamped${res.witnessed ? ' + witnessed on the board' : ''}`);
+      return;
+    }
+    const { board, dir } = await openCtx();
+    if (!procedure) {
+      const list = await annotateSchedules({ board, dir });
+      if (!list.length) return void console.log('no schedules — register one with: kanbento schedule <procedure>');
+      for (const s of list) {
+        const g = s.grant ? `  ·  ${grantSummary(s.grant)}` : '';
+        const warn = s.drifted ? '  ⚠ declaration changed — re-register' : '';
+        const legacy = s.legacy ? '  ⚠ legacy (no board identity)' : '';
+        console.log(`${s.procedure}  ·  ${s.cadence}  ·  at ${s.at}  ·  ${s.lastRun ? 'last run ' + s.lastRun.slice(0, 10) : 'never run'}${g}${warn}${legacy}`);
+      }
+      console.log(`\n${list.length} schedule(s)`);
+      for (const s of list.filter((x) => x.legacy)) {
+        console.log(`  hint: ${s.procedure} predates board-scoped schedules — re-run \`kanbento schedule ${s.procedure} --at ${s.at}\` to migrate it`);
+      }
+      return;
+    }
+    if (opts.remove) {
+      const res = await removeSchedule({ board, dir }, procedure);
+      console.log(res.removed ? `deregistered ${res.slug} — plist + state removed` : `${res.slug}: not scheduled (nothing to remove)`);
+      return;
+    }
+    const res = await registerSchedule({ board, dir }, procedure, { at: opts.at });
+    for (const n of res.notes) console.log(`  note: ${n}`);
+    console.log(`scheduled ${res.curie} · daily at ${res.at} → ${res.plist}`);
+    if (res.migrated) console.log(`  migrated a legacy (board-less) schedule for ${res.slug} — old plist unloaded, board-scoped state written`);
+    console.log(`  ${res.grantLine}`); // the frozen grant — registering is the consent act, so name what was granted
+    console.log(`  launchd ${res.bootstrapped ? 'bootstrapped' : 'bootstrap reported an issue — check `launchctl print gui/<uid>`'}`);
+    if (res.stamped) console.log(`  stamped \`schedule: daily @ ${res.at}\` into the record frontmatter`);
   });
 
 program
@@ -768,6 +849,44 @@ network
     console.error(path ? `\n-> ${path}` : `\n(anchorless — printed only; name a board "${name}" to persist its NETWORK.md)`);
   });
 
+// The init template ladder (getting-started-doc@66306ba0): a rung per stage count,
+// 2..5, keyed by that count. Each ships stages + roles + commitment/delivery points
+// ONLY — no types, WIP limits, or DoR/DoD prose (a board grows those as the flow
+// earns them). Data, not code: `chain` is the conceptual role chain (help/discovery),
+// `stages` maps each label to a real role from the closed vocabulary (protocol.js:
+// options/commit/active/loop/done). The default when neither --from nor --template is
+// given is the 4-stage board — a bare pool is no longer the starting point. Declared
+// above parseAsync so the command's --help / action can reference it (not hoisted).
+const TEMPLATES = {
+  2: {
+    chain: 'options → done',
+    blurb: 'pool + delivery — capture, then ship',
+    stages: [['backlog', 'options'], ['done', 'done']],
+  },
+  3: {
+    chain: 'options → active → done',
+    blurb: 'adds work-in-progress between the pool and delivery',
+    stages: [['backlog', 'options'], ['in_progress', 'active'], ['done', 'done']],
+  },
+  4: {
+    chain: 'options → committed → active → done',
+    blurb: 'the default — adds a commitment point before work starts',
+    stages: [['backlog', 'options'], ['selected', 'commit'], ['in_progress', 'active'], ['done', 'done']],
+  },
+  5: {
+    chain: 'options → committed → active → acceptance → done',
+    blurb: 'adds an acceptance checkpoint before delivery',
+    stages: [['backlog', 'options'], ['selected', 'commit'], ['in_progress', 'active'], ['review', 'loop'], ['done', 'done']],
+    // The lone non-forward edge, mirroring this repo's own manifest (kind:loop,
+    // bounded). It records that acceptance can fail — never that work "moves back";
+    // who acts on a rejection is deliberately unspecified (claims-mechanism@4673ece3),
+    // and whether the manifest needs this edge at all is under review (flags/blockers
+    // may make it redundant — see loop-edge-review card).
+    flows: [{ from: 'review', to: 'in_progress', kind: 'loop', maxIterations: 2 }],
+  },
+};
+const DEFAULT_TEMPLATE = 4;
+
 try {
   await program.parseAsync(process.argv);
 } catch (err) {
@@ -777,7 +896,7 @@ try {
 
 // --- setup (init / install) -------------------------------------------------
 
-async function initBoard(dir, label, from, identity = {}) {
+async function initBoard(dir, label, from, identity = {}, template = null) {
   // Everything kanbento lives under .kanbento/ — including the manifest — so the
   // project root stays clean (no clash with a web app's own manifest.json).
   const dataDir = dataDirIn(dir);
@@ -796,8 +915,9 @@ async function initBoard(dir, label, from, identity = {}) {
     await writeFile(join(dataDir, 'manifest.json'), JSON.stringify(seeded, null, 2) + '\n', 'utf8');
     console.log(`manifest: .kanbento/ (seeded from ${src} as "${id}")`);
   } else {
-    await writeFile(join(dataDir, 'manifest.json'), starterPool(label), 'utf8');
-    console.log('manifest: .kanbento/manifest.json (bare pool)');
+    const n = template ?? DEFAULT_TEMPLATE;
+    await writeFile(join(dataDir, 'manifest.json'), templateManifest(n, label), 'utf8');
+    console.log(`manifest: .kanbento/manifest.json (${n}-stage: ${TEMPLATES[n].chain})`);
   }
 
   await finalizeBoard(dir, label);
@@ -915,22 +1035,29 @@ async function upsertSection(filePath, body) {
   return 'appended';
 }
 
-function starterPool(label) {
+// Validate a --template value against the ladder; a bad rung errors cleanly.
+function resolveTemplate(raw) {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || !(n in TEMPLATES))
+    throw new Error(`init: --template must be one of ${Object.keys(TEMPLATES).join(', ')} (got "${raw}")`);
+  return n;
+}
+
+// Render a template's manifest — the board's OWN identity, derived from the target.
+function templateManifest(n, label) {
   const id = String(label || 'board').replace(/^@/, '').split(/[\\/]/).pop() || 'board';
-  return (
-    JSON.stringify(
-      {
-        manifestVersion: '1.0',
-        board: { id, name: id, revision: 0, maturity: 'pool' },
-        inbox: { sources: ['human', 'agent', 'request', 'feedback'], landing: 'backlog' },
-        stages: [{ id: 'backlog', role: 'options' }],
-        policies: { joining: 'A worker announces its capability profile on arrival.' },
-        cardSchema: { core: ['id', 'title', 'state', 'createdAt', 'updatedAt'], types: 'open' },
-      },
-      null,
-      2,
-    ) + '\n'
-  );
+  const t = TEMPLATES[n];
+  const stages = t.stages.map(([sid, role]) => ({ id: sid, role }));
+  const manifest = {
+    manifestVersion: '1.0',
+    board: { id, name: id, revision: 0, maturity: 'standard' },
+    inbox: { sources: ['human', 'agent', 'request', 'feedback'], landing: stages[0].id },
+    stages,
+    ...(t.flows ? { flows: t.flows } : {}),
+    policies: { joining: 'A worker announces its capability profile on arrival.' },
+    cardSchema: { core: ['id', 'title', 'state', 'createdAt', 'updatedAt'], types: 'open' },
+  };
+  return JSON.stringify(manifest, null, 2) + '\n';
 }
 
 // --- per-verb helpers -------------------------------------------------------

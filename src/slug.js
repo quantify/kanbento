@@ -17,6 +17,24 @@ export function slugify(s, max = 18) {
   return base.slice(0, end).replace(/-+$/, '');
 }
 
+// Sanitize an EXPLICIT --slug: the operator's chosen word, not a tag generated
+// from a title. Shares slugify's BASE charset transform (lowercase, non-
+// alphanumerics collapsed to single dashes, edges trimmed) — which by
+// construction neutralizes path separators, `..` traversal, and absolute-path
+// fragments, since none of `/ \ . :` survive — but applies NO word-boundary
+// cap. Why differ from a derived slug: slugify's own docstring promises an
+// explicit --slug is "kept literal" (an operator asking for a precise handle
+// means it), so silently shortening it corrupts their word. Guardrails are
+// loud, never silent: empty after sanitizing throws, and a pathological length
+// (>128) throws — a clear error beats a quiet truncation. PURE — no fs, no deps.
+export function explicitSlug(s) {
+  const raw = String(s ?? '');
+  const base = raw.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  if (!base) throw new Error(`--slug '${raw}' has no usable characters`);
+  if (base.length > 128) throw new Error('--slug exceeds 128 chars');
+  return base;
+}
+
 // Leading words a work-item title tends to open with — an imperative verb or an
 // article — that name nothing on their own ("reconsider/remove the → Next line" ->
 // "reconsider-remove"). Stripped so a DERIVED handle lands on the subject.

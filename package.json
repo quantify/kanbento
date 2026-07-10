@@ -1,6 +1,6 @@
 {
   "name": "kanbento",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "A file-based kanban board for coordinating work across agent sessions and repos.",
   "license": "FSL-1.1-Apache-2.0",
@@ -27,16 +27,17 @@
   "files": [
     "src",
     "procedures",
+    "!procedures/*/test",
     "examples/*/manifest.*",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
     "k": "node src/cli.js",
-    "test": "mocha test/*.test.js"
+    "test": "mocha \"test/*.test.js\" \"procedures/*/test/*.test.js\""
   },
   "engines": {
-    "node": ">=18.3"
+    "node": ">=22"
   },
   "dependencies": {
     "commander": "^15.0.0",
