@@ -1,6 +1,6 @@
 {
   "name": "kanbento",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "A file-based kanban board for coordinating work across agent sessions and repos.",
   "license": "FSL-1.1-Apache-2.0",
@@ -34,7 +34,8 @@
   ],
   "scripts": {
     "k": "node src/cli.js",
-    "test": "mocha \"test/*.test.js\" \"procedures/*/test/*.test.js\""
+    "test": "mocha \"test/*.test.js\" \"procedures/*/test/*.test.js\"",
+    "prepublishOnly": "npm audit --audit-level=low"
   },
   "engines": {
     "node": ">=22"
@@ -45,5 +46,9 @@
   },
   "devDependencies": {
     "mocha": "^11.7.6"
+  },
+  "overrides": {
+    "serialize-javascript": "^7.0.5",
+    "diff": "^8.0.3"
   }
 }
