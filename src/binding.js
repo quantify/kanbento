@@ -107,6 +107,7 @@ export async function indexRecords(def, root, { withBody = false } = {}) {
       verified: data.verified ?? null, // reaffirmation stamp: git:<sha> or date:<ISO> — the curation check clock
       revised: data.revised ?? null, // the edit clock — stamped at creation, reset on elaborate
       cadence: data.cadence ?? null, // a procedure's rhythm ('<n> commits' | '<n>d') — feeds last-ran/due
+      runner: data.runner ?? null, // a procedure's declared runner grant ({ model?, tools? }) — least-privilege needs
       parent, // the enclosing folder as a CURIE (nested types); null at the root
       ancestors,
       refs: data.refs ?? null,

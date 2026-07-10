@@ -7,10 +7,11 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { refsFromArgs, resolveRelKey, parseCurie, checkRelationStrict, refEdges, refTarget } from './refs.js';
 import { typeDef, isFlowType, BUILTIN_NOTE, embodiedTypes, vocabTerms } from './manifest.js';
-import { slugify, titleSlug } from './slug.js';
+import { slugify, titleSlug, explicitSlug } from './slug.js';
 import { readType, writeBack, indexRecords } from './binding.js';
 import { casesDir } from './cases.js';
 import { writeFrontmatterBlock, writeFrontmatterField, removeFrontmatterField, readFrontmatter } from './frontmatter.js';
+import { readScheduleState, grantSummary } from './schedule.js';
 
 const execFileP = promisify(execFile);
 
@@ -99,7 +100,7 @@ export async function captureCard({ board, dir }, body, opts = {}) {
   // artifact is born id-named and the semantic reslug renames it when it lands.
   // An explicit --slug always names.
   const derive = board.manifest.features?.slugify === true;
-  const artifactSlug = opts.slug || (derive ? titleSlug(firstLine) : id.slice(0, 8)); // names the artifact file
+  const artifactSlug = opts.slug ? explicitSlug(opts.slug) : (derive ? titleSlug(firstLine) : id.slice(0, 8)); // names the artifact file (explicit --slug: sanitized, never capped)
   // Validate everything that can fail (the --rel shape, an explicit-slug collision)
   // BEFORE the capture event or the artifact write — a failed verb leaves no trace.
   const payload = capturePayload(opts, board.manifest); // throws on a malformed --rel pair
@@ -115,7 +116,7 @@ export async function captureCard({ board, dir }, body, opts = {}) {
     idempotencyKey: opts.key,
     // store only an explicit handle; an auto slug is derived from the title at
     // render — dynamic (follows title/cap changes), since the id carries identity
-    slug: opts.slug ? slugify(opts.slug) : undefined,
+    slug: opts.slug ? explicitSlug(opts.slug) : undefined,
     payload, // --lane fields + --rel relations (under payload.refs) — validated above
   });
   if (artifact) {
@@ -176,7 +177,7 @@ export async function noteCard({ board, dir }, body, opts = {}) {
   // No reslug pipeline here (no card, no event) — the file needs its name NOW,
   // so the heuristic slug applies regardless of features.slugify. An explicit
   // --slug is pinned: a collision fails loudly rather than silently uniquifying.
-  const slug = opts.slug || titleSlug(firstLine) || id.slice(0, 8);
+  const slug = opts.slug ? explicitSlug(opts.slug) : (titleSlug(firstLine) || id.slice(0, 8));
   const artifact = embodimentArtifact(def, slug, id, dir, {}, { pinned: !!opts.slug });
   const abs = resolve(dir, artifact.path);
   await mkdir(dirname(abs), { recursive: true });
@@ -452,28 +453,63 @@ function procedureDef(manifest) {
 
 // Read the package's built-in procedures into the same record shape indexRecords
 // yields (curie, title, status, refs, body) plus a `builtin` marker. Empty if the
-// dir is missing. Slug = filename; the file's frontmatter supplies title/status/refs.
-async function readBuiltins() {
-  let files;
-  try { files = await readdir(BUILTIN_PROCEDURES_DIR); }
+// dir is missing. Two shapes: a flat `<slug>.md`, or a `<slug>/procedure.md` folder
+// that co-locates scripts alongside the prose (`home` = the folder's absolute path).
+// Either way slug = the file's/folder's name; the frontmatter supplies title/status/refs.
+export async function readBuiltins() {
+  let entries;
+  try { entries = await readdir(BUILTIN_PROCEDURES_DIR, { withFileTypes: true }); }
   catch { return []; } // no built-ins shipped (or dir absent) — degrade to board-only
   const out = [];
-  for (const f of files.sort()) {
-    if (extname(f) !== '.md') continue;
-    const slug = f.slice(0, -extname(f).length);
-    const { data, body } = await readFrontmatter(join(BUILTIN_PROCEDURES_DIR, f));
+  for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    // A folder built-in materializes when it holds a procedure.md; slug = folder name,
+    // home = its absolute path (the anchor the ## Scripts section lists against). A folder
+    // without procedure.md is silently skipped — same fail-soft as a missing dir.
+    let slug, file, home = null;
+    if (e.isDirectory()) {
+      const md = join(BUILTIN_PROCEDURES_DIR, e.name, 'procedure.md');
+      if (!existsSync(md)) continue;
+      slug = e.name; file = md; home = join(BUILTIN_PROCEDURES_DIR, e.name);
+    } else {
+      if (extname(e.name) !== '.md') continue;
+      slug = e.name.slice(0, -extname(e.name).length);
+      file = join(BUILTIN_PROCEDURES_DIR, e.name);
+    }
+    const { data, body } = await readFrontmatter(file);
     out.push({
-      path: f, home: f, identity: `builtin:${slug}`,
+      path: file, home, identity: `builtin:${slug}`,
       curie: `${PROCEDURE_TYPE}:${slug}`,
       title: data.title ?? slug,
       type: PROCEDURE_TYPE,
       status: data.status ?? null,
       refs: data.refs ?? null,
       cadence: data.cadence ?? null, // the built-in's rhythm, if it declares one — same as a board record
+      runner: data.runner ?? null, // the built-in's declared runner grant, if it declares one — same as a board record
       builtin: true,
       body,
     });
   }
+  return out;
+}
+
+// Every file co-located under a folder built-in's `home`, except its procedure.md — the
+// scripts the brief points the runner at. Recursive, sorted, returned as { rel, abs }
+// (relative to home for reading, absolute for running). Fail-soft: an unreadable home
+// yields nothing (the ## Scripts section just omits).
+async function builtinScripts(home) {
+  const out = [];
+  const walk = async (rel) => {
+    let ents;
+    try { ents = await readdir(join(home, rel), { withFileTypes: true }); }
+    catch { return; }
+    for (const e of ents.sort((a, b) => a.name.localeCompare(b.name))) {
+      const r = rel ? join(rel, e.name) : e.name;
+      if (e.isDirectory()) { await walk(r); continue; }
+      if (!rel && e.name === 'procedure.md') continue; // the prose itself, not a script
+      out.push({ rel: r, abs: join(home, r) });
+    }
+  };
+  await walk('');
   return out;
 }
 
@@ -530,22 +566,26 @@ function lastRuns(events) {
 // fold the ProcedureInvoked log against each record's `cadence:`.
 export async function listSkills({ board, dir }) {
   const def = procedureDef(board.manifest);
-  if (!def) return [];
-  const local = await indexRecords(def, dir);
+  // Built-ins are versioned with the tool and ride ANY board — even one that declares no
+  // `procedure` type. Only board-local records need the declared type (nothing to index
+  // without it). A local record still SHADOWS a same-slug built-in when the type IS declared.
+  const local = def ? await indexRecords(def, dir) : [];
   const localSlugs = new Set(local.map((r) => parseCurie(r.curie)?.slug).filter(Boolean));
   const builtins = (await readBuiltins()).filter((b) => !localSlugs.has(parseCurie(b.curie).slug));
   const runs = lastRuns(await board.events());
   const out = [];
   for (const r of [...local.map((r) => ({ ...r, builtin: false })), ...builtins]) {
     const lastRan = runs.get(r.curie) ?? null;
+    const slug = parseCurie(r.curie)?.slug ?? null;
     out.push({
       curie: r.curie,
-      slug: parseCurie(r.curie)?.slug ?? null,
+      slug,
       status: r.status ?? null,
       title: r.title,
       builtin: !!r.builtin,
       lastRan, // ISO of the latest ProcedureInvoked for this curie, or null (never invoked)
       due: await procedureDue(parseCadence(r.cadence), lastRan, dir),
+      schedule: await readScheduleState(slug, board.manifest?.board?.id, dir), // this board's OS-scheduler stamp, if registered
     });
   }
   return out.sort((a, b) => (a.slug ?? a.curie ?? '').localeCompare(b.slug ?? b.curie ?? ''));
@@ -555,11 +595,13 @@ export async function listSkills({ board, dir }) {
 // the package built-ins (a local record shadows a same-slug built-in). Shared by `do`
 // (assembleBrief) and `did` (registerRun) so both resolve identically and error the
 // same teaching way on an unknown name. withBody so a brief renderer gets the text.
-async function resolveProcedure({ board, dir }, name, { verb = 'do' } = {}) {
+export async function resolveProcedure({ board, dir }, name, { verb = 'do' } = {}) {
   const def = procedureDef(board.manifest);
+  // Built-ins resolve on ANY board (they ship with the tool). Only board-local records
+  // need the declared type; a local record shadows a same-slug built-in when it is declared.
   const local = def ? await indexRecords(def, dir, { withBody: true }) : [];
   const localSlugs = new Set(local.map((r) => parseCurie(r.curie)?.slug).filter(Boolean));
-  const builtins = def ? (await readBuiltins()).filter((b) => !localSlugs.has(parseCurie(b.curie).slug)) : [];
+  const builtins = (await readBuiltins()).filter((b) => !localSlugs.has(parseCurie(b.curie).slug));
   const curie = parseCurie(name);
   const match = (recs) => recs.filter((r) => (curie ? r.curie === name : r.curie?.endsWith(`:${name}`) || r.curie === name));
   // board-first: a local record shadows a built-in of the same slug — resolve against
@@ -622,6 +664,15 @@ export async function assembleProcedure({ board, dir }, name) {
   out.push(`procedure: ${rec.curie}${rec.status ? ` · status: ${rec.status}` : ''}`);
   if (deprecated) out.push('', '⚠ DEPRECATED — do NOT follow this procedure as-is; it has been superseded. See its replacement before acting.');
   out.push('', String(rec.body ?? '').trim());
+  // Folder built-ins ship deterministic extraction scripts next to the prose — list them
+  // so the runner invokes the shipped code verbatim instead of reinventing the extraction.
+  if (rec.home) {
+    const scripts = await builtinScripts(rec.home);
+    if (scripts.length) {
+      out.push('', '## Scripts', '', 'Co-located scripts — run them verbatim (they exist so extraction is deterministic); do not reimplement them.');
+      for (const s of scripts) out.push(`- ${s.rel} — ${s.abs}`);
+    }
+  }
   if (cases.length) {
     out.push('', '## Precedents', '', '_The knowing-when: precedents this procedure cites. Weigh each against the situation before acting._');
     for (const c of cases) out.push('', `### ${c.curie}`, '', c.content);
@@ -629,6 +680,17 @@ export async function assembleProcedure({ board, dir }, name) {
   if (pointers.length) {
     out.push('', '## Pointers', '');
     for (const p of pointers) out.push(`- ${p.rel}  ${p.curie}${p.where ? `  → ${p.where}` : ''}`);
+  }
+  // A scheduled routine advertises its rhythm — cadence, time-of-day, last run, and the
+  // plist backing it — so the served brief carries its own operating status.
+  const sched = await readScheduleState(parseCurie(rec.curie)?.slug, board.manifest?.board?.id, dir);
+  if (sched) {
+    out.push('', '## Schedule', '', 'Registered with the OS scheduler (launchd) — fires daily; the guard enforces the cadence window.');
+    out.push(`- cadence: ${sched.cadence}`);
+    out.push(`- at: ${sched.at}`);
+    out.push(`- last run: ${sched.lastRun ?? 'never'}`);
+    if (sched.grant) out.push(`- grant: ${grantSummary(sched.grant)}`); // the frozen runner grant — what --fire will hand the harness
+    out.push(`- plist: ${sched.plist}`);
   }
   // The epistemic contract travels with the served procedure, status-aware: deviation is a
   // contradiction detector (instruction vs context can't both be right), not

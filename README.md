@@ -16,7 +16,9 @@ npm install -g kanbento
 ```bash
 cd your-repo
 kanbento init                      # board + operating guide + root anchors
-kanbento capture "ship the login fix"
+                                   #   (--template 2..5 picks the flow depth; default 4:
+                                   #    options → committed → active → done)
+kanbento capture --slug login-fix "ship the login fix"
 kanbento commit login-fix          # cross the commitment point
 kanbento transition login-fix in_progress
 kanbento transition login-fix done
@@ -49,11 +51,12 @@ Humans read the views; agents read them too, then act through the CLI.
 
 A board is defined by a manifest (`.kanbento/manifest.json`) describing stages,
 WIP limits, gates, types, and relations. `kanbento schema` prints the full
-grammar. The default flow:
+grammar. The default flow (`--template 4`; rung 5 adds an `↻` acceptance
+checkpoint before delivery):
 
 ```
-○ backlog  →  ◆ ready  →  ▶ in_progress  →  ↻ review  →  ✓ done
-  options     commit       active            loop          delivered
+○ backlog  →  ◆ selected  →  ▶ in_progress  →  ✓ done
+  options     commit          active            delivered
 ```
 
 - `○` **options** — captured, uncommitted, discardable. Capture freely; the
@@ -108,12 +111,33 @@ kanbento do curate         # print one: instructions + precedents + pointers
 A **procedure** is executable knowledge — a recipe an agent runs with judgment,
 not a script. Procedures are markdown records with an optional `cadence:`
 (`7d`, `20 commits`); invocations are logged, so due-ness is derived, not
-scheduled. Two built-ins ship with the CLI: `pulse` (orient: what needs
-attention) and `curate` (knowledge upkeep). Boards add their own, and a local
-procedure with a built-in's name overrides it.
+scheduled. Three built-ins ship with the CLI: `pulse` (orient: what needs
+attention), `curate` (knowledge upkeep), and `status-update` (draft an outbound
+status report from local evidence — git + board events — for the human to
+approve and send). A built-in can be a folder co-locating deterministic
+extraction scripts with the prose. Boards add their own, and a local procedure
+with a built-in's name overrides it.
 
 Harness-independent by construction: any agent that can run a CLI can run
 `kanbento do pulse` — or be pointed at it with `claude -p "kanbento do pulse"`.
+
+**Experimental:** a routine with a daily cadence can be handed to the OS scheduler with
+`kanbento schedule <procedure> [--at HH:MM]` (`--remove` to deregister, bare
+`kanbento schedule` to list). kanbento never runs a daemon: it registers a
+launchd agent (macOS) that fires `kanbento schedule <slug> --fire` on the
+schedule. `--fire` is a two-stage job — a deterministic guard (skip unless the
+cadence window has elapsed) then a headless agent run that **halts at the
+consent gate**: it drafts, it never sends. A procedure can declare its
+least-privilege runner needs in a `runner:` block (a model suggestion and a
+`tools:` list) next to its `cadence:`. The effective grant — declaration overlaid
+by any home-config override — is resolved and **frozen at registration**:
+registering is the consent act, and `--fire` assembles the runner from the frozen
+grant alone, never a live re-read (so editing a procedure.md can't silently
+escalate its own permissions — a changed declaration prints a re-register
+warning in the listing). `~/.kanbento/config.json` holds the harness template
+(`runner`, e.g. `claude -p {prompt} --model {model} --allowedTools {tools}`, with
+`{prompt}`/`{model}`/`{tools}` placeholders; a template without `{prompt}` gets
+the prompt appended at the end) plus per-procedure overrides (`procedures.<slug>`).
 
 ## Cases — decisions that compound
 
@@ -185,7 +209,7 @@ The essentials:
 
 ## Requirements
 
-Node.js ≥ 18.3. Git is optional but recommended — worktree stamps,
+Node.js ≥ 22. Git is optional but recommended — worktree stamps,
 principal attribution, and verification pins degrade gracefully without it.
 
 ## License
