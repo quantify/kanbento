@@ -47,6 +47,15 @@ export function allowedSources(manifest) {
   return manifest.inbox?.sources ?? null; // null = unrestricted
 }
 
+// The admitted-sources enumeration for error messages — every source-related
+// rejection names the board's admitted kinds, so an agent gets its next move
+// without a manifest lookup. One helper, so the phrasing cannot drift between
+// errors. null when the inbox is open (nothing to enumerate).
+export function admittedSourcesNote(manifest) {
+  const sources = allowedSources(manifest);
+  return sources ? `admitted sources: ${sources.join(', ')} (inbox.sources)` : null;
+}
+
 // --- stages / flows (transition, commit) -------------------------------------
 
 export function stages(manifest) {
@@ -78,6 +87,15 @@ export function commitStageId(manifest) {
   return stages(manifest).find((s) => s.role === 'commit')?.id ?? null;
 }
 
+// The Options set, definitionally: every stage whose role is `options` — the
+// pre-commitment pool. Plural-aware (a board may declare several options stages)
+// and role-derived, never a hardcoded stage id (this board renamed its options
+// stage `pool`; others may name theirs anything). A card is an option iff its
+// `state` is one of these. Returns a Set of stage ids.
+export function optionsStageIds(manifest) {
+  return new Set(stages(manifest).filter((s) => s.role === 'options').map((s) => s.id));
+}
+
 export function wipEnforcement(manifest) {
   return manifest.policies?.wip?.enforcement ?? 'advisory';
 }
@@ -86,7 +104,13 @@ export function wipEnforcement(manifest) {
 // flow engine adds no per-type constraints (which stages it may use, per-type
 // payload) unless the flow earns them — keep types simple.
 export function cardTypes(manifest) {
-  if (Array.isArray(manifest.types)) return manifest.types.filter(isFlowType).map((t) => t.id);
+  if (Array.isArray(manifest.types)) {
+    // Only FLOW types close the set. A manifest that declares records alone (the
+    // default init template: `procedure`, flow:false) still has open card types —
+    // otherwise `capture --type bug` fails against an empty list.
+    const flow = manifest.types.filter(isFlowType).map((t) => t.id);
+    return flow.length ? flow : null;
+  }
   const t = manifest.cardSchema?.types;
   return Array.isArray(t) ? t : null; // null = open / unrestricted
 }
@@ -107,7 +131,7 @@ export function isFlowType(def) {
 // week of "X doesn't know the builtin" bugs, one caller at a time.
 export function typeDef(manifest, id) {
   const declared = (manifest.types ?? []).find((t) => t.id === id) ?? null;
-  return declared ?? (id === BUILTIN_NOTE.id ? BUILTIN_NOTE : null);
+  return declared ?? BUILTINS.find((b) => b.id === id) ?? null;
 }
 
 // The builtin note type — the knowledge layer's zero-declaration default, so
@@ -115,18 +139,42 @@ export function typeDef(manifest, id) {
 // type shadows it (custom path/marker — the usual progressive refinement).
 export const BUILTIN_NOTE = Object.freeze({ id: 'note', embodiment: 'file', path: '.kanbento/notes/{slug}.md', flow: false });
 
-// Every embodied type the fs scan should walk: the declared ones plus the builtin
-// `note` (unless shadowed) — so bare-board notes are visible to refs/maps/sweep.
+// The builtin case type — case-based decisioning is a kanbento primitive (the
+// `cases` command exists on every board), so its precedent files are first-class
+// knowledge records, indexed like notes. This is what makes a precedent's `about`
+// citation a real graph edge: refs/backlinks/maps surface the cases decided about a
+// record. A declared `case` type shadows it (the usual progressive refinement).
+export const BUILTIN_CASE = Object.freeze({ id: 'case', embodiment: 'file', path: '.kanbento/cases/{slug}.md', flow: false });
+
+// The zero-declaration builtins, resolved by typeDef/embodiedTypes unless a manifest
+// declares its own type of the same id (shadowing).
+const BUILTINS = [BUILTIN_NOTE, BUILTIN_CASE];
+
+// Every embodied type the fs scan should walk: the declared ones plus the builtins
+// (`note`, `case`) not shadowed by a declaration — so bare-board notes and case
+// precedents are visible to refs/maps/sweep.
 export function embodiedTypes(manifest) {
   const declared = (manifest.types ?? []).filter((t) => t.embodiment && t.embodiment !== 'none');
-  const shadowed = (manifest.types ?? []).some((t) => t.id === BUILTIN_NOTE.id);
-  return shadowed ? declared : [...declared, BUILTIN_NOTE];
+  const declaredIds = new Set((manifest.types ?? []).map((t) => t.id));
+  return [...declared, ...BUILTINS.filter((b) => !declaredIds.has(b.id))];
 }
 
 // The knowledge-record types among them (flow:false) — what sweep enriches and
 // `note` may write to; flow cards are owned by the log, not the fs.
 export function recordTypes(manifest) {
   return embodiedTypes(manifest).filter((t) => !isFlowType(t));
+}
+
+// Every DECLARED embodied type flagged `runnable: true` — the types whose records the
+// runner serves (`do` / `--exec` / `--finalize`). Runnability is a declared type-level
+// property, NOT the magic `procedure` name/path: any type with `runnable: true` and a
+// file/folder embodiment gets the runner. A runtime flag can't express "the runner
+// treats records of this type as executable" — it's a type-level capability parallel to
+// `flow`. Declaration order is preserved, so it is the deterministic precedence order for
+// a slug that collides across two runnable types (first-declared type wins). The package
+// built-ins are NOT gated on this — they're kanbento internals, always runnable.
+export function runnableDefs(manifest) {
+  return (manifest.types ?? []).filter((t) => t.runnable === true && t.embodiment && t.embodiment !== 'none');
 }
 
 // The terms of a vocabulary (a status set, lane values, …). Accepts a bare list
@@ -178,10 +226,20 @@ export function boardNetworks(manifest) {
 // name, resolved against the card's payload), so the partition value is plain
 // card data — one source of truth, not a parallel namespace. `values` (optional)
 // closes the set: validation, stable ordering, and empty lanes.
+// The axis name `scope` is RESERVED: scope is a card field with its own mechanics
+// (vocabulary, cwd inference, storage), not a lane — an axis literally named
+// `scope` would silently shadow it, so it is refused loudly here (every read
+// path and compile normalize through this function).
 export function lanes(manifest) {
-  return (manifest.lanes ?? [])
+  const out = (manifest.lanes ?? [])
     .filter((l) => l && l.axis)
     .map((l) => ({ axis: l.axis, from: l.from ?? l.axis, name: l.name ?? l.axis, values: l.values ?? null }));
+  for (const l of out) {
+    if (l.axis === 'scope') {
+      throw new Error('lanes: axis "scope" is reserved — scope is a card field (assigned with capture --scope / inferred from cwd), a lane is a projection; for scope swimlanes declare a lane that projects the field, e.g. { axis: "product", from: "scope" }');
+    }
+  }
+  return out;
 }
 
 // A card's value on one lane axis: read the `from` field (payload first, then the

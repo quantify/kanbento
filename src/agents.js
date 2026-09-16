@@ -1,5 +1,7 @@
 import { stages, isFlowType, portfolioTypes } from './manifest.js';
+import { scopeDecl } from './scope.js';
 import { expandedRelations } from './refs.js';
+import { boardRepertoire } from './collaborate.js';
 import { GLYPH, ROLE_MEANING } from './protocol.js';
 
 // Render the board's operating guide (AGENTS.md) — a compile target.
@@ -10,7 +12,7 @@ import { GLYPH, ROLE_MEANING } from './protocol.js';
 // Generated from the manifest, so the pipeline and gate prose track the real
 // board; do not hand-edit. Operating instructions only — no positioning.
 
-export function renderAgents(manifest, { cli = 'kanbento', verbs = [] } = {}) {
+export function renderAgents(manifest, { cli = 'kanbento', verbs = [], hasVendor = false } = {}) {
   const board = manifest.board ?? {};
   const st = stages(manifest);
   const rolesUsed = [...new Set(st.map((s) => s.role).filter((r) => GLYPH[r]))];
@@ -34,7 +36,7 @@ export function renderAgents(manifest, { cli = 'kanbento', verbs = [] } = {}) {
   out.push('## Legend');
   out.push('');
   for (const r of rolesUsed) out.push(`- \`${GLYPH[r]} ${r}\` — ${ROLE_MEANING[r]}`);
-  out.push('- `[3]` count · `[1/2]` count / WIP · `↳abc12345` parent (lineage) · `↺2` reworked twice · `🔗` bound doc · `⛔` blocked · `→rel=target` ref · bare = about');
+  out.push('- `[3]` count · `[1/2]` count / WIP · `↳abc12345` parent (lineage) · `↺2` loop-edge rounds (boards that declare a loop flow) · `⟳N` open Rework · `🔗` bound doc · `⛔` blocked · `@scope` product scope (no chip = unscoped) · `→rel=target` ref · bare = about');
   out.push('');
 
   out.push('## This board');
@@ -74,6 +76,35 @@ export function renderAgents(manifest, { cli = 'kanbento', verbs = [] } = {}) {
         })
         .join(' · ')} — typed edges; connect with \`link <from> <rel> <to>\`.`,
     );
+  }
+  const repertoire = boardRepertoire(manifest);
+  const patterns = Object.entries(repertoire);
+  if (patterns.length) {
+    out.push('');
+    const games = patterns.map(([pat, e]) => `\`${pat}\`${e.agreement ? ` — agreement \`${e.agreement}\`` : ''}`).join(' · ');
+    const pick = patterns.length > 1 ? ' Invocation picks the game (`act --protocol <pattern>`); the opening move records the choice.' : '';
+    out.push(
+      `Protocol repertoire (how roles collaborate): ${games}.${pick} The BSPL moves live in the agreement doc; enact them with \`act <card> <Move>\`, read the enactment with \`workspace <card>\`.`,
+    );
+  }
+  const scope = scopeDecl(manifest);
+  if (scope) {
+    out.push('');
+    if (scope.map) {
+      const vocab = Object.keys(scope.map).sort().map((id) => `\`${id}\``).join(' · ');
+      out.push(
+        `Scopes (product axis): enumerated map ${vocab} — keys are the vocabulary, values are path grounding (exhaustive; unmapped dirs do not auto-register). Capture infers the scope from your cwd inside a mapped root; \`--scope <s>\` overrides; a card carries at most one, a record zero-or-more via frontmatter \`scope:\` (none = universal). Scope is a card field; a lane is a projection — a board wanting scope swimlanes declares a lane with \`from: scope\`. Card docs MATERIALIZE on demand under \`data/<scope>/cards/\` (\`data/cards/\` = the unscoped queue — work it down with \`kanbento scope <ref> [<s>]\` (omit the value to heal placement)); directories appear on first use, and docs bound before the scope declaration keep their original paths. Filter with \`pool --scope\` / \`search --scope\`.`,
+      );
+    } else {
+      const vocab = [...scope.patterns.map((p) => `\`${p}\``), ...scope.declared.map((d) => `\`${d}\``)].join(' · ');
+      out.push(
+        `Scopes (product axis): derived from ${vocab} — every matching directory IS a scope, resolved at read time (\`mkdir\` registers one). Capture infers the scope from your cwd inside a scope root; \`--scope <s>\` overrides; a card carries at most one, a record zero-or-more via frontmatter \`scope:\` (none = universal). Scope is a card field; a lane is a projection — a board wanting scope swimlanes declares a lane with \`from: scope\`. Card docs MATERIALIZE on demand under \`data/<scope>/cards/\` (\`data/cards/\` = the unscoped queue — work it down with \`kanbento scope <ref> [<s>]\` (omit the value to heal placement)); directories appear on first use, and docs bound before the scope declaration keep their original paths. Filter with \`pool --scope\` / \`search --scope\`.`,
+      );
+    }
+  }
+  if (hasVendor) {
+    out.push('');
+    out.push('Vendored docs live under `.kanbento/vendor/<host>/`.');
   }
   const positions = portfolioTypes(manifest);
   if (positions.length) {

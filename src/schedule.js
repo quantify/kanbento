@@ -2,14 +2,20 @@ import { homedir } from 'node:os';
 import { join, resolve, delimiter, dirname } from 'node:path';
 import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, writeFile, readFile, readdir, unlink } from 'node:fs/promises';
-import { execFile, spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { kanbentoHome, manifestPathIn, dataDirIn } from './boards.js';
+import { kanbentoHome, manifestPathIn, dataDirIn, dataFilePath } from './boards.js';
 import { parseCurie } from './refs.js';
 import { resolveProcedure, parseCadence } from './commands.js';
 import { writeFrontmatterField, removeFrontmatterField } from './frontmatter.js';
 import { openBoard } from './kernel.js';
 import { FileLog } from './eventlog.js';
+import { readConfig, runnerTemplate, resolveGrant, grantSummary, assembleRunner, runShell } from './runnercmd.js';
+
+// The runner-command seam (template grammar, config.json read, grant resolution,
+// shell assembly) moved to runnercmd.js so `do --exec` and `schedule --fire` share
+// one seam — re-exported here so schedule stays the historical import site.
+export { resolveGrant, grantSummary, assembleRunner, DEFAULT_RUNNER_TEMPLATE } from './runnercmd.js';
 
 const execFileP = promisify(execFile);
 
@@ -131,12 +137,24 @@ export function stableNodePath({ execPath = process.execPath, wellKnown = WELL_K
 
 // Render a launchd LaunchAgent plist: a daily StartCalendarInterval that re-invokes the
 // kanbento CLI as `schedule <fireKey> --fire`, logging both streams to the slug's log file.
-export function renderPlist({ label, node, cliEntry, slug, boardId, hour, minute, outPath }) {
+export function renderPlist({ label, node, cliEntry, slug, boardId, hour, minute, outPath, pathEnv }) {
   // The fire key IS the state file's own basename — `<boardId>.<slug>` for a board-qualified
   // schedule, bare `<slug>` for a legacy one — so `--fire` resolves state without parsing.
   const fireKey = boardId ? `${boardId}.${slug}` : slug;
   const argv = [node, cliEntry, 'schedule', fireKey, '--fire'];
   const args = argv.map((a) => `    <string>${xmlEscape(a)}</string>`).join('\n');
+  // launchd spawns the job with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), so the runner's
+  // `claude` (or any bare command) isn't found and the morning run dies with exit 127. Bake the
+  // registering user's PATH in so the runner spawn resolves it — frozen at registration, so
+  // re-register to refresh. Omitted entirely when empty (legacy plists carry no such block).
+  const envBlock = pathEnv
+    ? `  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${xmlEscape(pathEnv)}</string>
+  </dict>
+`
+    : '';
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -160,7 +178,7 @@ ${args}
   <string>${xmlEscape(outPath)}</string>
   <key>RunAtLoad</key>
   <false/>
-</dict>
+${envBlock}</dict>
 </plist>
 `;
 }
@@ -279,6 +297,7 @@ export async function registerSchedule({ board, dir }, name, opts = {}) {
     hour,
     minute,
     outPath: logPath(slug, boardId),
+    pathEnv: process.env.PATH, // launchd's minimal PATH can't find the runner's `claude`; freeze ours (re-register to refresh)
   });
   await writeFile(plist, xml, 'utf8');
 
@@ -363,107 +382,6 @@ function cadenceDays(cadence) {
 function localDaysBetween(fromMs, toMs) {
   const midnight = (ms) => { const d = new Date(ms); return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(); };
   return Math.round((midnight(toMs) - midnight(fromMs)) / 86400000);
-}
-
-function shellQuote(s) {
-  return `'${String(s).replace(/'/g, `'\\''`)}'`;
-}
-
-function runShell(cmd, cwd) {
-  return new Promise((res) => {
-    const child = spawn('sh', ['-c', cmd], { cwd, stdio: 'inherit' });
-    child.on('exit', (code) => res(code ?? 0));
-    child.on('error', () => res(1));
-  });
-}
-
-// The harness flag grammar lives HERE, in one named constant — never scattered through
-// logic. A config.json without a `runner` key gets this default, so per-routine grants
-// reach the deployed harness (Claude Code) out of the box. A second harness swaps this
-// one line (or overrides `runner` in config.json); nothing else in kanbento knows a
-// concrete flag name. Placeholders: {prompt}, {model}, {tools} (tools joined with commas).
-// The prompt sits BEFORE --allowedTools: that flag is VARIADIC in the claude CLI, so a
-// trailing positional prompt would be swallowed as another tool name.
-export const DEFAULT_RUNNER_TEMPLATE = 'claude -p {prompt} --model {model} --allowedTools {tools}';
-
-// Read ~/.kanbento/config.json (under KANBENTO_HOME). Returns {} when absent/unreadable —
-// every consumer defaults from there.
-async function readConfig() {
-  try {
-    return JSON.parse(await readFile(join(kanbentoHome(), 'config.json'), 'utf8'));
-  } catch {
-    return {}; // no config — callers default
-  }
-}
-
-// The runner TEMPLATE: an explicit config.json `runner` string, else the default template.
-function runnerTemplate(cfg) {
-  return typeof cfg.runner === 'string' ? cfg.runner : DEFAULT_RUNNER_TEMPLATE;
-}
-
-// Resolve the effective grant at registration: declared frontmatter defaults, overlaid by
-// the home config's per-procedure override (override wins wholesale, per key). Model absent
-// → null (inherit the runner default); tools absent → [] (no extra grant).
-export function resolveGrant(declared, override) {
-  const d = declared ?? {};
-  const o = override ?? {};
-  return {
-    model: o.model ?? d.model ?? null,
-    tools: o.tools ?? d.tools ?? [],
-  };
-}
-
-// A one-line human summary of a grant — printed at register (informed consent) and shown
-// in the list + brief. "model=default · tools=Bash(kanbento *), Read" (or "tools=none").
-export function grantSummary(grant) {
-  const g = grant ?? {};
-  const model = g.model || 'default';
-  const tools = g.tools?.length ? g.tools.join(', ') : 'none';
-  return `model=${model} · tools=${tools}`;
-}
-
-// Substitute {prompt}/{model}/{tools} in a template's whitespace-separated tokens. A grant
-// placeholder ({model}/{tools}) that resolves empty is dropped ALONG WITH its adjacent flag
-// token (the previous token starting with '-') so nothing dangles — `--model {model}`
-// vanishes entirely when the grant has no model. {prompt} is never dropped. Tools join with
-// commas. Each substituted value is shell-quoted: the command runs under `sh -c`, and the
-// default tool grammar — `Bash(kanbento *)` — carries parens, spaces, and globs by design;
-// unquoted it would misparse.
-function substituteTemplate(template, grant, prompt) {
-  const values = {
-    '{prompt}': prompt ?? '',
-    '{model}': grant?.model || '',
-    '{tools}': grant?.tools?.length ? grant.tools.join(',') : '',
-  };
-  const tokens = template.split(/\s+/).filter(Boolean);
-  const out = [];
-  for (const tok of tokens) {
-    if (Object.prototype.hasOwnProperty.call(values, tok)) {
-      const val = values[tok];
-      if (val === '' && tok !== '{prompt}') {
-        if (out.length && out[out.length - 1].startsWith('-')) out.pop(); // drop the dangling flag
-        continue;
-      }
-      out.push(shellQuote(val));
-    } else {
-      out.push(tok);
-    }
-  }
-  return out.join(' ');
-}
-
-// Assemble the runner invocation from a template + a frozen grant + the prompt. A template
-// carrying {prompt}/{model}/{tools} placeholders gets them substituted (empty grant segments
-// dropped); a placeholder-free template (a bare `claude -p`, or the KANBENTO_RUNNER stub) is
-// used as-is — grant flags simply don't reach a template that never asked for them. The
-// prompt lands where {prompt} says; a template WITHOUT {prompt} gets it appended
-// shell-quoted at the end (backward compat — but a variadic flag like claude's
-// --allowedTools would swallow a trailing positional, hence the placeholder).
-export function assembleRunner(template, grant, prompt) {
-  const hasPlaceholder = /\{(prompt|model|tools)\}/.test(template);
-  const base = hasPlaceholder ? substituteTemplate(template, grant, prompt) : template;
-  if (template.includes('{prompt}')) return base;
-  return `${base} ${shellQuote(prompt)}`;
 }
 
 // Compare a routine's CURRENT frontmatter runner declaration against the snapshot frozen at
@@ -555,6 +473,17 @@ export async function fireSchedule(_ctx, name, opts = {}) {
     }
     return { slug, ran: true, exitCode: 0, witnessed };
   }
+  // Exit 127 is `command not found` — almost always the runner (`claude`) off launchd's minimal
+  // PATH. Name the fix so a silent morning failure is self-diagnosing.
+  if (code === 127) {
+    return {
+      slug,
+      ran: true,
+      failed: true,
+      exitCode: code,
+      hint: `the runner command was not found on PATH — re-run \`kanbento schedule ${slug}\` to re-register with the current PATH, or set an absolute-path \`runner\` in ~/.kanbento/config.json`,
+    };
+  }
   return { slug, ran: true, failed: true, exitCode: code };
 }
 
@@ -564,7 +493,7 @@ export async function fireSchedule(_ctx, name, opts = {}) {
 async function witnessInvocation(boardDir, curie) {
   const board = await openBoard({
     manifestPath: manifestPathIn(boardDir),
-    log: new FileLog(join(dataDirIn(boardDir), 'events.jsonl')),
+    log: new FileLog(dataFilePath(boardDir, 'events.jsonl')),
     boardDir,
   });
   await board.procedureInvoked(curie, { by: 'schedule' });

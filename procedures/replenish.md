@@ -1,0 +1,45 @@
+---
+title: "Replenish — the upstream coordinator: triage certainty, dispatch prep on the ready and explore on the uncertain, compile the iteration plan, commit on disposition"
+type: procedure
+status: draft
+params:
+  goal:
+    required: true
+---
+**When to run**: when delivery capacity frees at the commitment point — replenishment is the upstream loop that feeds it. Invoke with the iteration's intent: `kanbento do replenish goal="…"`.
+
+**The concept.** Replenishment is selection + commitment, and **selection requires certainty**: an option with full certainty would already be committed or discarded — *staying in the pool is the manifestation of uncertainty*. So each cycle produces TWO outputs, not one: an **iteration plan** of items certain enough to select now, and **uncertainty-reduction work** (analyses run, probes formulated, watches stood) whose results the NEXT replenishment selects on. A cycle that only picks work and never reduces uncertainty leaves the pool exactly as undecidable as it found it.
+
+**Just-in-time, not detached grooming.** Triage and prep run INSIDE the replenishment, at the pull moment — never as a standing "backlog grooming" ritual. Readiness information decays (a card groomed last week describes last week's codebase); evaluating at pull time means the readiness verdict is fresh exactly when it is spent. The two honest outcomes: ready NOW → pull, or not ready → measurably closer for the next run (evidence accreted, instruments stood) — never a groomed card whose grooming has already gone stale.
+
+**You are a coordinator, not a worker.** Triage and the plan are yours; the leg work is dispatched to fresh agents running the worker procedures — `prep` (make a candidate commit-ready) and `explore` (diagnose an option's uncertainty, formulate its instrument). Dispatch with your harness's sub-agent mechanism or headless (`claude -p "kanbento do prep card=<ref>"`); workers report back, you dispose. Workers write knowledge (links, elaborations, criteria) but never move cards; you commit only at step 7, only on disposition.
+
+## The pass
+
+1. **Orient on the goal** — read `views/BOARD.md` (and `views/PORTFOLIO.md` if the board projects positions). Restate the goal in one line: **${params.goal}**. Check capacity honestly: free WIP at the commitment point and downstream — finish-first applies; if the pipeline is full, replenishment waits (report that and stop).
+
+2. **Shortlist — and recall.** Sweep the pool for options bearing on the goal — orient from `views/POOL.md` (one line per card with age and refs), not the raw store: refs into the goal's positions or related cards (`kanbento refs`), title/body relevance, judgment. Then sweep what the board already KNOWS about this territory before triaging anything — reach for **`kanbento search <terms>`** first (one ranked query over the whole store — every record AND card, archived included — surfaces the ground a scoped grep or single-CURIE lookup misses), then follow the hits down: the goal's records and their backlinks (`kanbento refs <curie>`), prior cards in the same ground — including delivered and archived ones, whose outcomes are evidence — and precedents (`kanbento cases`). An option is triaged against the board's accumulated knowledge, not from its own text alone; much apparent uncertainty is knowledge nobody recalled. In particular, cross-check each shortlisted card against RECENT DELIVERY (the git log, done cards) before dispatching a worker at it — pools accumulate stale-delivered options (captured just before their own fix shipped, never closed), and dispatching prep at one wastes the cycle. For each candidate note its evidence state — how long in the pool, when it last received material evidence, whether an instrument already stands on it.
+
+3. **Triage each candidate — certainty first.** Classify the *kind* of certainty available; the class picks the dispatch:
+   - **Clear** — solution known, no material uncertainty → **selection candidate** (a clear item lingering in the pool is a priority question, not a knowledge gap — decide it, don't study it).
+   - **Clear-what, unsettled-how** — the problem statement is settled but several solution shapes compete → **design candidate** (the choice of shape is the remaining uncertainty; arguing it at triage is doing the worker's job badly).
+   - **Complicated / Complex** — uncertainty remains, reducible by analysis or only by evidence → **exploration candidate**.
+   - **Unplaceable** — cannot classify → decompose into parts that classify, or discard on sight (an empty or obsolete capture should not survive triage).
+
+4. **Dispatch the workers** — in parallel where independent:
+   - each selection candidate → a fresh agent on **`kanbento do prep card=<ref>`** — it connects, sharpens, seeds acceptance criteria, and returns READY / NOT-READY against the board's Ready gate.
+   - each design candidate → a fresh agent on **`kanbento do design card=<ref>`** — it diverges over anchored candidate solutions, converges by delegated adversarial critique against a declared fitness axis, materializes the narrowed bet + acceptance criteria on the card, and returns a verdict (spec-settled / problem-restated / wrong-dispatch: needs explore).
+   - each exploration candidate → a fresh agent on **`kanbento do explore card=<ref>`** — it names the binding uncertainty dimension, runs what preliminary analysis can run now, formulates the deeper probe/spike or the watch, accretes findings onto the card, and returns a verdict (now-selectable / instrument-formulated / decompose / expire-candidate).
+   Fold the reports: a NOT-READY with a certainty gap re-routes to explore; a now-selectable or spec-settled joins the candidates; a problem-restated may re-run design once (a second bounce re-routes to explore); an expire-candidate joins the triaged-out list.
+
+5. **Compile the iteration plan** — a simple markdown list, coherent against the goal, sized to WIP (a plan is small):
+   - **Selected**: each item as `<ref> — <one-line why it serves the goal>`, in intended order — READY-verdict candidates, plus formulated probes committed as work.
+   - **Instruments**: watches to stand and probes formulated for later cycles, each with the question it answers and where its result lands — what the next replenishment inherits.
+   - **Triaged out**: discards, expirations, and decompositions, one line each (the reason is knowledge — keep it).
+   **Materialize the plan — always.** The plan is a batch-level work item with its own lifecycle, not a generic note. If the board declares a `plan` (or `iteration`) record type, materialize it there (`kanbento note --type plan --slug <goal-ish> -F <file>` — no date in the slug: the record's own metadata carries when; suffix a counter only if the same goal spawns a second tranche) with its status at the type's proposed/pre-disposition value — the record IS the tranche, and its status field carries the go/no-go. Fallback where no such type exists: a note, or elaborate onto the goal's card. Either way the plan is the artifact the disposition gate holds FOR — the OK arrives after this pass ends, and Start (step 7) executes against the written plan, not against a chat transcript. Repeat the plan in your report, but the record is the record.
+
+6. **Disposition gate — present, then wait.** Show the plan. Do not commit anything without disposition (a human OK, or a standing authorization the board has recorded). Disposition may arrive as an **edited plan** — the materialized record is the disposition surface, and a trimmed plan IS the verdict: the surviving items are the authorized set, the removed ones are declined (they stay pooled with whatever evidence workers accreted). Where the plan is a typed record, the go/no-go is its **status flip** (proposed → committed, or → declined — a no-go is decision history, kept). The gate holds COMMITMENT only — step 8's harvest runs on every cycle, held or started, and the workers' knowledge writes (links, criteria, elaborations) stand regardless: they are evidence, not commitment.
+
+7. **Start (on OK)** — make the commitment physical: flip the plan record's status to committed, then `kanbento commit <ref>` for each authorized card, crossing the board's Ready gate honestly (prep should have made this a formality — if a gate criterion still fails, the prep report overstated readiness: fix, and note it in harvest). Stand the planned watches. Capture probe cards where a probe is itself a unit of work. Delivery from here belongs to the board's delivery process — this procedure ends at the commitment point. When the tranche's members later finish, the plan settles (status → settled, outcome noted on the record) — the iteration ledger closes one entry at a time.
+
+8. **Harvest — every cycle, held or started.** Friction met while replenishing is a signal: `kanbento capture` a card per gap; a contested triage call is precedent (`kanbento cases retain …`). Report: the plan, what was committed (or that the gate held), instruments stood, worker verdicts folded, and what the next replenishment will know that this one did not.

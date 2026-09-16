@@ -21,12 +21,12 @@ function parseArgs(argv) {
   return out;
 }
 
-// Walk up from `start` for a .kanbento dir that actually holds an events.jsonl (the log is
-// the thing we read — a bare .kanbento without one is not the board we want).
+// Walk up from `start` for a .kanbento dir that actually holds a data/events.jsonl (the log
+// is the thing we read — a bare .kanbento without one is not the board we want).
 function findEventsFile(start) {
   let dir = start;
   for (;;) {
-    const f = join(dir, '.kanbento', 'events.jsonl');
+    const f = join(dir, '.kanbento', 'data', 'events.jsonl');
     if (existsSync(f)) return f;
     const up = dirname(dir);
     if (up === dir) return null; // reached the filesystem root without a log
@@ -41,6 +41,7 @@ function detailOf(e) {
     case 'ItemCaptured': return `landed ${e.landing ?? '?'}${e.cardType ? ` (${e.cardType})` : ''}`;
     case 'CardTransitioned': return `${e.from ?? '?'} → ${e.to ?? '?'}${e.via ? ` (${e.via})` : ''}`;
     case 'CardSlugged': return `slug ${e.slug ?? ''}`.trim();
+    case 'CardScoped': return `${e.from ?? '∅'} → ${e.scope ?? '∅'}`;
     case 'CardRetitled': return `title ${e.title ?? ''}`.trim();
     case 'CardBound': return 'bound doc';
     case 'CardLinked': return `+${e.rel ?? 'rel'} → ${e.target ?? '?'}`;
@@ -80,17 +81,17 @@ async function main() {
   const untilMs = until != null ? Date.parse(until) : null;
 
   const root = args.board ? join(args.board) : process.cwd();
-  // An explicit --board points AT a repo (its .kanbento inside) or a .kanbento itself; a
-  // bare run walks up from cwd. Try <board>/.kanbento/events.jsonl, then <board>/events.jsonl.
+  // An explicit --board points AT a repo (its .kanbento inside) or a .kanbento itself; a bare
+  // run walks up from cwd. Try <board>/.kanbento/data/events.jsonl, then <board>/data/events.jsonl.
   let file = null;
   if (args.board) {
-    for (const cand of [join(root, '.kanbento', 'events.jsonl'), join(root, 'events.jsonl')]) {
+    for (const cand of [join(root, '.kanbento', 'data', 'events.jsonl'), join(root, 'data', 'events.jsonl')]) {
       if (existsSync(cand)) { file = cand; break; }
     }
   } else {
     file = findEventsFile(root);
   }
-  if (!file) { console.log('board-activity: no board found (no .kanbento/events.jsonl) — no board evidence available'); return; }
+  if (!file) { console.log('board-activity: no board found (no .kanbento/data/events.jsonl) — no board evidence available'); return; }
 
   let raw;
   try { raw = await readFile(file, 'utf8'); }

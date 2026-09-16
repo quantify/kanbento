@@ -18,9 +18,14 @@ export async function indexDocs(root, pattern, exclude) {
   return out.filter((p) => !skip.has(p)).sort(); // e.g. *.md excluding *.brief.md
 }
 
+// The placeholder token NAMES a path template declares, in order: {website},{slug}.
+const templateTokens = (path) => [...(path ?? '').matchAll(/\{([^}]+)\}/g)].map((m) => m[1]);
+
 // Where a type's frontmatter lives, as a glob. For a file embodiment that's the
 // file itself; for a folder it's the marker inside each workspace. {slug} -> *.
-function artifactIndex(def) {
+// Each placeholder compiles to a single-segment `*` (glob) / `[^/]+` (regex) — it
+// never crosses a directory boundary, so the template stays anchored to its shape.
+export function artifactIndex(def) {
   const toGlob = (p) => p.replace(/\{[^}]+\}/g, '*'); // {slug} + any lane token: content/{website}/{slug}.md -> content/*/*.md
   if (def.nested) {
     // a TREE: records at any depth under the type's root; the enclosing folders are
@@ -28,6 +33,17 @@ function artifactIndex(def) {
     const base = def.path.slice(0, def.path.indexOf('{'));
     const ext = def.path.slice(def.path.lastIndexOf('.'));
     return { pattern: `${base}**/*${ext}`, base, nested: true, folder: false };
+  }
+  // A non-nested template resolves each artifact's identity from its {slug} segment
+  // (pathToken). A template with placeholders but no {slug} — e.g. packages/{package}/AGENTS.md
+  // — gives every match a null identity: the graph layer then over-collects them into
+  // one parentless bucket and recurses without bound (stack overflow, seen in the hyperdx
+  // run). Fail loud, naming the template, rather than emit identity-less records.
+  const tokens = templateTokens(def.path);
+  if (tokens.length && !tokens.includes('slug')) {
+    throw new Error(
+      `path template "${def.path}"${def.id ? ` (type ${def.id})` : ''} has placeholder(s) {${tokens.join('}, {')}} but no {slug}: the varying identity segment must be named {slug} (e.g. packages/{slug}/AGENTS.md).`,
+    );
   }
   const index = toGlob(def.path);
   if (def.embodiment === 'folder') {
@@ -102,12 +118,19 @@ export async function indexRecords(def, root, { withBody = false } = {}) {
       identity: data[idField] ?? home,
       curie: slug ? `${def.id}:${slug}` : null,
       title: data.title ?? home,
+      description: data.description ?? null, // a short gloss when the frontmatter carries one — a search field
       type: def.id,
       status: data[def.status?.field ?? 'status'] ?? null, // the record's declared lifecycle state, if any
+      scope: data.scope ?? null, // zero-or-more product scopes (string or list; absent = universal) — frontmatter-owned, never a folder
       verified: data.verified ?? null, // reaffirmation stamp: git:<sha> or date:<ISO> — the curation check clock
       revised: data.revised ?? null, // the edit clock — stamped at creation, reset on elaborate
       cadence: data.cadence ?? null, // a procedure's rhythm ('<n> commits' | '<n>d') — feeds last-ran/due
       runner: data.runner ?? null, // a procedure's declared runner grant ({ model?, tools? }) — least-privilege needs
+      params: data.params ?? null, // a procedure's declared params — engages the runner (validation + interpolation)
+      artifacts: data.artifacts ?? null, // a procedure's declared run deliverables — validated + disposed at finalize
+      sandbox: data.sandbox ?? null, // a procedure's --exec sandbox grants ({ network?, read?, write? }) — merged over the floor
+      workspace: data.workspace ?? null, // a procedure's intake mode: fs (default) | worktree ({ mode, base }) — the runner materializes a git checkout + diff-for-free
+      lineage: data.lineage ?? null, // observe-capture source template, e.g. "github:org/repo#${params.issue}"
       parent, // the enclosing folder as a CURIE (nested types); null at the root
       ancestors,
       refs: data.refs ?? null,

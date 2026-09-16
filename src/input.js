@@ -9,7 +9,15 @@ import { spawnSync } from 'node:child_process';
 // a terminal — an interactive editor; finally '' (the caller turns that into a
 // helpful "body required" error). The two file/stdin paths are the automation-grade
 // ones; the editor is the human ad-hoc fallback.
-export function resolveBody(text, opts, { noEditor = false } = {}) {
+// `noStdin` closes the IMPLICIT stdin branch below (never the explicit `-F -`).
+// Read stdin implicitly only where the body is MANDATORY — capture/note/request/
+// feedback all throw without one, so a non-TTY fd can only be what the caller meant.
+// Where the body is OPTIONAL (elaborate: --title/--slug alone is a complete action),
+// "no body wanted" and "body on stdin" are byte-identical from inside the process,
+// and guessing "mine" corrupts the card AND drains the caller's fd — the classic
+// `ssh` inside `while read` hazard, whose remedy (ssh -n) is the same shape as this.
+// The explicit spelling stays available: `-F -`, as in `git commit -F -`.
+export function resolveBody(text, opts, { noEditor = false, noStdin = false } = {}) {
   // -F always wins, INCLUDING the stdin form: `-F -` with inline text means
   // "the text is the title, stdin is the body" — falling through to the text
   // here silently dropped the heredoc (the stdin sibling of the 7b346f3 bug).
@@ -18,7 +26,7 @@ export function resolveBody(text, opts, { noEditor = false } = {}) {
   }
   if (opts.bodyFile) return readFileSync(resolve(opts.bodyFile), 'utf8');
   if (text && text.length) return text.join(' ');
-  if (!process.stdin.isTTY) {
+  if (!noStdin && !process.stdin.isTTY) {
     try { return readFileSync(0, 'utf8'); } catch { return ''; } // piped stdin / heredoc
   }
   if (!noEditor && process.stdin.isTTY) return editBody(); // no input arrived on a terminal → open $EDITOR
