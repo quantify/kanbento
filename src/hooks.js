@@ -2,8 +2,8 @@ import { spawn } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { stages, stageById } from './manifest.js';
-import { stageAgreementPath } from './refs.js';
-import { parseAgreement, SEVERITY } from './agreement.js';
+import { stageAgreementPath, stageProcedurePath } from './refs.js';
+import { parseAgreement } from './agreement.js';
 
 // The reactive subsystem. The kernel engineers context for each event; a hook's
 // evaluator judges it. The evaluator is an LLM by default (`claude -p`) but may
@@ -32,58 +32,12 @@ function whereMatches(where, event) {
   return Object.entries(where).every(([k, v]) => event[k] === v);
 }
 
-// Synthesize the before-hooks that enforce stage agreements on a forward move — both ends
-// of the one transition: the stage being *left* must be Done (exit), the stage being
-// *entered* must be Ready (entry). Either, both, or neither fire, depending on which stages
-// carry an agreement and which sections it fills. Declaring an `agreement` is enough — no
-// manual `hooks:` entry. Forward-only: a loop-back/abandon is neither "done" nor a fresh
-// pull. Non-agreement transitions cost only the lookup.
-export function agreementHooks(manifest, event, phase, boardDir) {
-  if (process.env.KANBENTO_NO_HOOKS === '1') return [];
-  if ((event.cause?.depth ?? 0) >= MAX_DEPTH) return [];
-  if (phase !== 'before' || event.type !== 'CardTransitioned' || !event.from) return [];
-  if (!isForward(manifest, event.from, event.to)) return [];
-  return [
-    sectionHook(manifest, event.from, 'done', boardDir), // exit: the Definition of Done
-    sectionHook(manifest, event.to, 'ready', boardDir), // entry: the Definition of Ready
-  ].filter(Boolean);
-}
-
-// One hook for one section of one stage's agreement (its Done, or its Ready). null when the
-// stage has no agreement or nothing in that section. The DoD judges the produced artifact;
-// the DoR judges the item's readiness — same `claude -p` machinery, different evidence.
-function sectionHook(manifest, stageId, section, boardDir) {
-  // Only criteria with an explicit severity (MUST/SHOULD/MAY) are judged; one stated without
-  // a keyword is open for interpretation, left to the agent — no value judging vague conditions.
-  const criteria = stageCriteria(manifest, stageId, section, boardDir).filter((c) => c.severity);
-  if (!criteria.length) return null;
-  const dod = section === 'done';
-  return {
-    id: `agreement:${stageId}:${dod ? 'dod' : 'dor'}`,
-    on: 'CardTransitioned',
-    phase: 'before',
-    evaluator: manifest.agreementEvaluator, // undefined -> default claude -p; a script/local model for determinism or tests
-    policy: formatCriteria(stageId, section, criteria),
-    evaluate: dod
-      ? 'Judge whether the work satisfies the Definition of Done above. MUST items are blocking — ' +
-        'answer approve:false if ANY MUST is unmet; SHOULD/MAY are advisory. The work to judge is the ' +
-        "card's bound artifact (card.binding.path) — open and inspect it; do not range beyond it."
-      : 'Judge whether the item is ready to start this stage per the Definition of Ready above. MUST ' +
-        'items are blocking — answer approve:false if ANY MUST is unmet; SHOULD/MAY are advisory. Base ' +
-        'the judgment on the card (its description, acceptance criteria, refs) and any bound artifact.',
-  };
-}
-
-function formatCriteria(stageId, section, criteria) {
-  const kind = section === 'done' ? 'Done' : 'Ready';
-  const lines = criteria.map((c) => `- ${c.text}  [${SEVERITY[c.severity]}]`);
-  return `Definition of ${kind} for "${stageId}":\n${lines.join('\n')}`;
-}
-
 // The DoR/DoD criteria for a stage's section as [{severity, text}], from the inline manifest
 // form (`stage.entry`/`exit` = [[severity, text], ...]) or, failing that, the agreement doc's
-// Ready/Done. entry == ready (DoR), exit == done (DoD).
-function stageCriteria(manifest, stageId, section, boardDir) {
+// Ready/Done. entry == ready (DoR), exit == done (DoD). These criteria feed the gate checklist
+// injected on a forward transition (gateChecklistItems) — the specialist self-evaluates the
+// injected list; no separate evaluator fires on the transition (the double-gating is gone).
+export function stageCriteria(manifest, stageId, section, boardDir) {
   const inline = stageById(manifest, stageId)?.[section === 'done' ? 'exit' : 'entry'];
   if (Array.isArray(inline)) return inline.map(normalizeCriterion);
   const rel = stageAgreementPath(manifest, stageId);
@@ -91,6 +45,42 @@ function stageCriteria(manifest, stageId, section, boardDir) {
   const path = resolve(boardDir ?? '.', rel);
   if (!existsSync(path)) return [];
   return parseAgreement(readFileSync(path, 'utf8'))[section] ?? [];
+}
+
+// Per-stage gate checklist: list name + items seeded on a forward transition into `stageId`.
+// entry → DoR items, exit → DoD items; role encoded as a `DoR:` / `DoD:` text prefix (checklist
+// items have no role field). Strength carried as uppercase MUST/SHOULD/MAY when present.
+// Returns null when the stage has neither entry nor exit criteria (do not create an empty list).
+// De-dupes by final item text so a repeated criterion seeds once.
+export function gateChecklistItems(manifest, stageId, boardDir) {
+  const items = [];
+  const seen = new Set();
+  const push = (role, criteria) => {
+    for (const c of criteria) {
+      const text = formatGateItem(role, c);
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      items.push({ text, done: false });
+    }
+  };
+  push('DoR', stageCriteria(manifest, stageId, 'ready', boardDir));
+  push('DoD', stageCriteria(manifest, stageId, 'done', boardDir));
+  if (!items.length) return null;
+  return { listName: `${stageId} gate`, items };
+}
+
+const SEV_WORD = { must: 'MUST', should: 'SHOULD', may: 'MAY' };
+// Leading RFC-2119 keyword already embedded in criterion text (agreement docs keep the word).
+const LEADING_SEV = /^(?:MUST(?:\s+NOT)?|SHALL(?:\s+NOT)?|REQUIRED|SHOULD(?:\s+NOT)?|RECOMMENDED|MAY|OPTIONAL)\b/i;
+
+function formatGateItem(role, { severity, text }) {
+  const t = String(text ?? '').trim();
+  if (!t) return null;
+  // Agreement prose already carries the keyword ("MUST inputs are defined") — role-prefix only.
+  // Inline tuples separate severity from text (['SHOULD', 'the card names']) — insert the word.
+  if (LEADING_SEV.test(t)) return `${role}: ${t}`;
+  const word = severity ? SEV_WORD[severity] : null;
+  return word ? `${role}: ${word} ${t}` : `${role}: ${t}`;
 }
 
 // Normalize an inline criterion to {severity, text}: a ['MUST', 'text'] tuple, a
@@ -117,11 +107,19 @@ function normSeverity(s) {
 // this so the doer sees the SOP and the bar its work will be judged against. Body
 // comes only from an agreement doc; inline entry/exit carry criteria but no prose.
 export function stageContract(manifest, stageId, boardDir) {
-  return {
+  const contract = {
     body: agreementBody(manifest, stageId, boardDir),
     ready: stageCriteria(manifest, stageId, 'ready', boardDir),
     done: stageCriteria(manifest, stageId, 'done', boardDir),
   };
+  // A stage may declare a distinct worker (`stage.procedure`) ALONGSIDE its agreement gate:
+  // the agreement's Body is its own prose, the procedure is a separate SOP pointer. When both
+  // are present, surface the worker pointer too (the agreement supplies body/ready/done). A
+  // single-declaration stage is untouched — agreement-only or procedure-only returns exactly
+  // {body, ready, done}, no `procedure` key, as before.
+  const proc = stageProcedurePath(manifest, stageId);
+  if (proc && stageAgreementPath(manifest, stageId)) contract.procedure = proc;
+  return contract;
 }
 
 function agreementBody(manifest, stageId, boardDir) {
@@ -133,7 +131,8 @@ function agreementBody(manifest, stageId, boardDir) {
 }
 
 // Forward = the target stage sits later in the declared order than the source.
-function isForward(manifest, from, to) {
+// Used by the transition gate-checklist seed to inject DoR/DoD only on a forward move.
+export function isForward(manifest, from, to) {
   const ids = stages(manifest).map((s) => s.id);
   const i = ids.indexOf(from);
   return i >= 0 && ids.indexOf(to) > i;

@@ -1,17 +1,20 @@
-import { join, resolve, dirname, extname } from 'node:path';
+import { join, resolve, dirname, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
-import { mkdir, writeFile, readFile, rename, readdir } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { mkdir, writeFile, readFile, rename, readdir, realpath, unlink } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { refsFromArgs, resolveRelKey, parseCurie, checkRelationStrict, refEdges, refTarget } from './refs.js';
-import { typeDef, isFlowType, BUILTIN_NOTE, embodiedTypes, vocabTerms } from './manifest.js';
+import { typeDef, isFlowType, BUILTIN_NOTE, embodiedTypes, runnableDefs, vocabTerms } from './manifest.js';
 import { slugify, titleSlug, explicitSlug } from './slug.js';
-import { readType, writeBack, indexRecords } from './binding.js';
+import { readType, writeBack, indexRecords, indexDocs, artifactIndex } from './binding.js';
 import { casesDir } from './cases.js';
+import { resolveScopes, assertScope, inferScopeFromPath, cardDocTemplate, cardScope, expectedCardDocPath } from './scope.js';
 import { writeFrontmatterBlock, writeFrontmatterField, removeFrontmatterField, readFrontmatter } from './frontmatter.js';
 import { readScheduleState, grantSummary } from './schedule.js';
+import { runWitness } from './runner.js';
+import { foldAccretion } from './accretion.js';
 
 const execFileP = promisify(execFile);
 
@@ -59,10 +62,15 @@ export function parseLane(pairs) {
   if (!pairs?.length) return undefined;
   const lane = {};
   for (const p of pairs) {
-    const [k, v] = p.split('=');
-    if (k && v) lane[k] = v;
+    const i = p.indexOf('=');
+    const k = i > 0 ? p.slice(0, i) : '';
+    const v = i >= 0 ? p.slice(i + 1) : '';
+    // A malformed pair is an error, not a silent drop — dropping let `--lane scope=`
+    // slip past the scope-removal guard with no trace.
+    if (!k || !v) throw new Error(`--lane: malformed pair "${p}" — expected key=value`);
+    lane[k] = v;
   }
-  return Object.keys(lane).length ? lane : undefined;
+  return lane;
 }
 
 // The capture payload: lane fields (top-level) + typed references (under `refs`).
@@ -79,11 +87,55 @@ function namespacedRefs(refs, manifest) {
   return Object.fromEntries(Object.entries(refs).map(([k, v]) => [resolveRelKey(manifest, k), v]));
 }
 
+// Preferred stored spelling for a resolved knowledge piece — same policy as link:
+// typed card → type:slug CURIE; untyped/slugless card → slug or id; record → its CURIE.
+export function storedRelTarget(piece) {
+  if (piece.kind === 'card') {
+    const c = piece.card;
+    return (c.type && c.slug) ? `${c.type}:${c.slug}` : (c.slug ?? c.id);
+  }
+  return piece.record.curie;
+}
+
+// Resolve one --rel RHS handle to the stable form stored on the edge. Accepts any
+// unambiguous <ref> (slug, id, slug@id, CURIE, prefix). A well-formed CURIE that
+// matches nothing is kept as a frontier/forward ref (knowledge capture). Anything
+// else unresolvable fails loud — bare handles need a board match.
+export async function resolveRelTarget({ board, dir }, raw) {
+  const value = String(raw ?? '').trim();
+  if (!value) throw new Error('refs: empty target — pass key=<ref> (slug, id, CURIE, or prefix)');
+  let piece;
+  try {
+    piece = await resolvePiece({ board, dir }, value);
+  } catch (e) {
+    const msg = e?.message ?? String(e);
+    // resolvePiece / board.card throw on ambiguity — re-prefix so the --rel path is obvious
+    if (/ambiguous/i.test(msg)) throw new Error(msg.startsWith('refs:') ? msg : `refs: ${msg}`);
+    throw e;
+  }
+  if (piece) return storedRelTarget(piece);
+  if (parseCurie(value)) return value; // frontier CURIE — typed forward-ref still allowed
+  throw new Error(`refs: "${value}" not found as a handle; use a slug/id/CURIE the board knows, or type:slug for a frontier ref`);
+}
+
+// Resolve every value in a refs map. PURE over the map shape; resolution is
+// board-backed. Undefined in → undefined out (no empty refs block).
+export async function resolveRelTargets(ctx, refs) {
+  if (!refs) return refs;
+  const out = {};
+  for (const [rel, values] of Object.entries(refs)) {
+    const list = Array.isArray(values) ? values : values == null ? [] : [values];
+    out[rel] = [];
+    for (const v of list) out[rel].push(await resolveRelTarget(ctx, v));
+  }
+  return out;
+}
+
 // Capture one item: mint the card, materialize a typed artifact (born tracked), and
 // bind a doc when the body is rich (the one-step capture + elaborate). Returns
 // { card, artifact, boundDoc } for the caller to present.
 export async function captureCard({ board, dir }, body, opts = {}) {
-  if (!body.trim()) throw new Error('capture: no text — pass inline text, -F <file>, or pipe stdin');
+  if (!body.trim()) throw new Error(`capture: no text — pass inline text, -F <file>, or pipe stdin${opts.claimedHint ?? ''}`);
   const def = opts.type ? typeDef(board.manifest, opts.type) : null;
   if (def && !isFlowType(def)) {
     // reject before materializing — the kernel gates this too, but by then the artifact would exist
@@ -101,9 +153,36 @@ export async function captureCard({ board, dir }, body, opts = {}) {
   // An explicit --slug always names.
   const derive = board.manifest.features?.slugify === true;
   const artifactSlug = opts.slug ? explicitSlug(opts.slug) : (derive ? titleSlug(firstLine) : id.slice(0, 8)); // names the artifact file (explicit --slug: sanitized, never capped)
-  // Validate everything that can fail (the --rel shape, an explicit-slug collision)
-  // BEFORE the capture event or the artifact write — a failed verb leaves no trace.
-  const payload = capturePayload(opts, board.manifest); // throws on a malformed --rel pair
+  // Validate everything that can fail (the --rel shape, handle resolution, an
+  // explicit-slug collision) BEFORE the capture event or the artifact write —
+  // a failed verb leaves no trace (atomicity).
+  // Scope is a card field, not a lane — the borrowed `--lane scope=` spelling was
+  // removed (no alias; two spellings for one concept teach the wrong model). Refuse
+  // it loudly with the pointer to the dedicated flag.
+  // Raw-pair check so an empty value (`--lane scope=`) or bare key still gets THIS
+  // teaching error rather than the generic malformed-pair one.
+  if (opts.lane?.some((p) => p === 'scope' || p.startsWith('scope='))) {
+    throw new Error('capture: --lane scope= was removed — scope is a card field, not a lane; assign it with --scope <s> (a board wanting scope swimlanes declares a lane with from: scope)');
+  }
+  let payload = capturePayload(opts, board.manifest); // throws on a malformed --rel pair
+  if (payload?.refs) payload.refs = await resolveRelTargets({ board, dir }, payload.refs); // bare handles → stable stored form
+  // Product scope (note:scope-segregation): the vocabulary resolves from the manifest's
+  // declared topology at read time. An explicit `--scope` wins (validated — closed
+  // by the world); else the cwd infers: capturing from inside a scope root assigns that
+  // scope with zero per-capture tax. A board that declares no scope is untouched.
+  const scopes = resolveScopes(board.manifest, dir);
+  if (opts.scope != null && !scopes) {
+    throw new Error('capture: --scope needs the board to declare a scope vocabulary (manifest `scope:`, e.g. scope: apps/*)');
+  }
+  if (scopes) {
+    if (opts.scope != null) {
+      assertScope(scopes, String(opts.scope), 'capture');
+      (payload ??= {}).scope = String(opts.scope);
+    } else {
+      const inferred = inferScopeFromPath(scopes, dir, opts.cwd ?? process.cwd());
+      if (inferred) (payload ??= {}).scope = inferred;
+    }
+  }
   const artifact = embodimentArtifact(def, artifactSlug, id, dir, parseLane(opts.lane) ?? {}, { pinned: !!opts.slug });
   const card = await board.capture({
     id,
@@ -148,44 +227,76 @@ function revisionStamp() {
   return new Date().toISOString().slice(0, 10);
 }
 
-// Should `sweep` refresh a record's `revised:` edit clock? PURE — the day-granular
-// staleness test behind the mtime-driven refresh: a file modified after the day it
-// was stamped (or never stamped) is stale. Idempotent by construction: a restamp
-// sets revised=today and mtime≈now (same day), so an unchanged record — mtimeDay <=
-// revisedDay — is never touched again. Accepts a string or a js-yaml Date for `revised`.
-export function revisedStale(revised, mtimeMs) {
-  const revisedDay = revised instanceof Date
-    ? revised.toISOString().slice(0, 10)
-    : typeof revised === 'string' ? revised.slice(0, 10) : null;
-  if (revisedDay == null) return true; // never stamped — a hand-created/edited record
-  return new Date(mtimeMs).toISOString().slice(0, 10) > revisedDay;
+// A record's content-change signal for `sweep`'s `revised:` refresh — PURE. mtime is
+// NOT this signal: git checkout/merge and artifact materialization bump mtime without
+// touching bytes, so keying the restamp off mtime (the old revisedStale predicate)
+// falsely reset revised: on untouched records and corrupted curation's freshness clock
+// (sweep-restamps-untouched@67325ca4). We hash the file's bytes instead: the digest
+// moves only when content actually moves.
+export function contentDigest(text) {
+  return createHash('sha256').update(text ?? '', 'utf8').digest('hex');
+}
+
+// Should `sweep` restamp `revised:` on this record? Content-change, not mtime:
+//   - a prior digest that DIFFERS from the file's current digest → content genuinely
+//     changed (a hand edit) → restamp (this preserves mtime-revised-drift@71692bd8 —
+//     hand-edited records still get their edit clock reset).
+//   - a prior digest that MATCHES → only the mtime moved (checkout/merge/materialize) →
+//     leave revised: alone. THIS is the bug fix.
+//   - NO prior digest (first sight) → there is no content baseline to compare against,
+//     so restamping would be an mtime guess — exactly the false restamp (a fresh
+//     checkout bumps every mtime). Seed the baseline silently, never restamp; a later
+//     real edit trips the digest. The one-time cost: an edit made before a record's
+//     first-ever sweep won't reset revised — acceptable next to corrupting the whole
+//     corpus on every checkout, and the steady state (regular sweeps) catches all edits.
+export function sweepShouldRestamp(priorDigest, currentDigest) {
+  if (priorDigest == null) return false; // first sight — seed, never restamp off mtime
+  return priorDigest !== currentDigest;
 }
 
 export async function noteCard({ board, dir }, body, opts = {}) {
   const text = (body ?? '').trim();
-  if (!text) throw new Error('note: no content (inline text, -F <file>, or piped stdin)');
+  if (!text) throw new Error(`note: no content (inline text, -F <file>, or piped stdin)${opts.claimedHint ?? ''}`);
   const typeId = opts.type ?? BUILTIN_NOTE.id;
   const def = typeDef(board.manifest, typeId); // resolves the builtin note too (the chokepoint)
   if (!def) throw new Error(`note: type "${typeId}" is not declared`);
   if (isFlowType(def)) throw new Error(`note: "${typeId}" is a flow type — it mints a card with a status; use capture`);
   if (!def.embodiment || def.embodiment === 'none') throw new Error(`note: type "${typeId}" has no embodiment — nowhere to write`);
+  // Title: explicit --title (or inline text with -F) wins; else body's first line
+  // (heading marker stripped). Auto-slug follows the resolved title so a short
+  // --title is not forced to share the body's first-paragraph wording.
   const firstLine = text.split('\n')[0].replace(/^#+\s*/, '').trim();
+  const title = (opts.title != null && String(opts.title).trim()) ? String(opts.title).trim() : firstLine;
   const id = randomUUID();
   // Validate every arg that can fail BEFORE touching the filesystem, so a bad --rel
-  // (or a swallowed positional token) never leaves an orphan file behind (atomicity).
-  const refs = namespacedRefs(refsFromArgs(opts.rel), board.manifest); // throws on a malformed --rel pair
+  // (or a swallowed positional token / unresolvable handle) never leaves an orphan
+  // file behind (atomicity). Bare handles resolve to the stable stored form first.
+  let refs = namespacedRefs(refsFromArgs(opts.rel), board.manifest); // throws on a malformed --rel pair
+  if (refs) refs = await resolveRelTargets({ board, dir }, refs);
   // No reslug pipeline here (no card, no event) — the file needs its name NOW,
   // so the heuristic slug applies regardless of features.slugify. An explicit
   // --slug is pinned: a collision fails loudly rather than silently uniquifying.
-  const slug = opts.slug ? explicitSlug(opts.slug) : (titleSlug(firstLine) || id.slice(0, 8));
+  const slug = opts.slug ? explicitSlug(opts.slug) : (titleSlug(title) || id.slice(0, 8));
+  // Record scopes (zero-or-more; zero = universal): validated against the resolved
+  // vocabulary, written to frontmatter below. NEVER a folder placement — a record's
+  // scope is many-valued and lives in its frontmatter (note:scope-segregation).
+  const noteScopes = (Array.isArray(opts.scope) ? opts.scope : String(opts.scope ?? '').split(','))
+    .map((s) => String(s).trim())
+    .filter(Boolean);
+  if (noteScopes.length) {
+    const scopes = resolveScopes(board.manifest, dir);
+    if (!scopes) throw new Error('note: --scope needs the board to declare a scope vocabulary (manifest `scope:`, e.g. scope: apps/*)');
+    for (const s of noteScopes) assertScope(scopes, s, 'note');
+  }
   const artifact = embodimentArtifact(def, slug, id, dir, {}, { pinned: !!opts.slug });
   const abs = resolve(dir, artifact.path);
   await mkdir(dirname(abs), { recursive: true });
-  const front = { kanbento_id: id, title: opts.title ?? firstLine };
+  const front = { kanbento_id: id, title };
   if (opts.type) front.type = def.id; // a typed record self-describes; a bare note stays type-less
   if (def.status?.values) front[def.status.field ?? 'status'] = vocabTerms(def.status.values)[0]; // seed the lifecycle at its first declared state (capability -> idea)
   await writeFile(abs, `${newFrontmatter(front)}${text}\n`, 'utf8');
   if (refs && Object.keys(refs).length) await writeFrontmatterBlock(abs, 'refs', refs);
+  if (noteScopes.length) await writeFrontmatterBlock(abs, 'scope', noteScopes); // zero-or-more; absent = universal
   await writeFrontmatterField(abs, 'revised', revisionStamp()); // start the freshness clock
   return { id, artifact, curie: `${def.id}:${artifact.slug}` };
 }
@@ -248,9 +359,7 @@ export async function linkRefs({ board, dir }, fromRef, rel, toRef) {
     const to = await resolvePiece({ board, dir }, toRef);
     if (!to) throw new Error(`link: "${toRef}" matches no card or record`);
     if (to.kind === 'card' && to.card.id === from.card.id) throw new Error('link: a card cannot link to itself');
-    const target = to.kind === 'card'
-      ? (to.card.type && to.card.slug ? `${to.card.type}:${to.card.slug}` : to.card.slug ?? to.card.id)
-      : to.record.curie;
+    const target = storedRelTarget(to);
     const targetType = to.kind === 'card' ? to.card.type : to.record.type;
     const res = await board.link(fromRef, rel, target, { target, targetType });
     return { kind: 'card', from: res.from, rel: res.rel, target: res.target, card: res.card };
@@ -265,7 +374,7 @@ export async function linkRefs({ board, dir }, fromRef, rel, toRef) {
     // rather than drop it and report success (the old phantom).
     throw new Error(`link: card ${to.card.id.slice(0, 8)} has no CURIE handle (needs type:slug) — a record can only reference a slugged, typed card; give it a slug first`);
   }
-  const target = to.kind === 'card' ? `${to.card.type}:${to.card.slug}` : to.record.curie;
+  const target = storedRelTarget(to);
   const targetType = to.kind === 'card' ? to.card.type : to.record.type;
   const record = from.record;
   const existing = refEdges(record.refs, { rel }).length;
@@ -292,9 +401,7 @@ export async function unlinkRefs({ board, dir }, fromRef, rel, toRef) {
   let resolved = null;
   try {
     const to = await resolvePiece({ board, dir }, toRef);
-    if (to) resolved = to.kind === 'card'
-      ? (to.card.type && to.card.slug ? `${to.card.type}:${to.card.slug}` : to.card.slug ?? to.card.id)
-      : to.record.curie;
+    if (to) resolved = storedRelTarget(to);
   } catch { /* an ambiguous ref — fall back to the verbatim toRef */ }
   if (from.kind === 'card') {
     // Hand the kernel both the resolved spelling and the verbatim toRef; it retracts
@@ -330,10 +437,14 @@ export async function resolvePiece({ board, dir }, ref) {
 // The card's doc: an existing binding, or a freshly materialized cards/{slug}.md.
 // The slug leads (mirrors the slug@id handle); a short id is appended only on a
 // name clash — reusing exactly how a typed card materializes its artifact.
+// On a scope-declaring board the doc rides the scope-major layout instead:
+// data/<scope>/cards/{slug}.md, with data/cards/ as the visible unscoped queue
+// (cardDocTemplate). `kanbento scope` is the mover; this only materializes a
+// headless card at the current template.
 export async function ensureCardDoc({ board, dir }, card, body = '') {
   let rel = card.binding?.path;
   if (rel) return rel;
-  const doc = embodimentArtifact({ embodiment: 'file', path: '.kanbento/cards/{slug}.md' }, card.slug ?? card.id.slice(0, 8), card.id, dir, {});
+  const doc = embodimentArtifact({ embodiment: 'file', path: cardDocTemplate(board.manifest, cardScope(card)) }, card.slug ?? card.id.slice(0, 8), card.id, dir, {});
   rel = doc.path;
   const abs = resolve(dir, rel);
   await mkdir(dirname(abs), { recursive: true });
@@ -343,39 +454,105 @@ export async function ensureCardDoc({ board, dir }, card, body = '') {
 }
 
 // Give a card a body: materialize its doc on demand and (when content is given)
-// overwrite it. --title corrects the card's title in the same breath — titles
-// rot as understanding improves, and elaboration is exactly when they do; a
-// CardRetitled event lands the correction (titles are log-owned) and the doc's
-// frontmatter follows. Returns { card, rel, wrote, retitled } — with empty
-// content the doc is only ensured, for the caller's interactive $EDITOR path.
-export async function elaborateCard({ board, dir }, ref, content = '', { title } = {}) {
+// APPEND to it — a card's body accretes like everything else in the ontology
+// (events, records, precedents), so a fresh-session agent can't nuke a body it
+// never saw; the rare deliberate rewrite passes --replace. --title corrects the
+// card's title in the same breath — titles rot as understanding improves, and
+// elaboration is exactly when they do; a CardRetitled event lands the correction
+// (titles are log-owned) and the doc's frontmatter follows. Returns { card, rel,
+// wrote, retitled } — with empty content the doc is only ensured, for the
+// caller's interactive $EDITOR path.
+export async function elaborateCard({ board, dir }, ref, content = '', { title, replace } = {}) {
   let card = await board.card(ref);
   if (!card) {
     // A record (a knowledge piece — e.g. a capability position) can be elaborated
-    // too, but it ACCRETES: append to its body, never overwrite the knowledge, and
-    // there's no title correction (a record is titled in its own frontmatter).
+    // too: it ACCRETES by default like everything else; --replace is the deliberate
+    // consolidation/correction path (the frontmatter — identity, status, refs —
+    // survives; only the body is rewritten). --title corrects the record's title in
+    // the same breath (written to the frontmatter, not the log — see below).
     const piece = await resolvePiece({ board, dir }, ref);
     if (piece?.kind === 'record') {
-      if (title?.trim()) throw new Error('elaborate: --title is a card-only correction; a record is titled in its frontmatter');
       const relPath = piece.record.path;
-      if (!content.trim()) return { record: piece.record, rel: relPath, wrote: false };
       const abs = resolve(dir, relPath);
+      const target = piece.record.curie ?? relPath;
+      // --title now follows the body on a RECORD too — the moment a --replace
+      // consolidation lands is exactly when the title most needs to catch up (the same
+      // rationale the card path names). The asymmetry was only mechanical: a card title
+      // is log-owned (CardRetitled), a record title is file-owned frontmatter — one
+      // writeFrontmatterField next to `revised`. The retitle is still WITNESSED, not a
+      // silent file write: the Elaborated event carries it (a `retitle` mode when
+      // title-only, a `retitled` flag when it rides a body write). foldAccretion ignores
+      // a `retitle` event — a retitle is a revision, not a body append, so it must never
+      // inflate the accretion nudge.
+      const newTitle = title?.trim();
+      const retitled = !!(newTitle && newTitle !== piece.record.title);
+      if (!content.trim()) {
+        // Title-only (or a pure no-op) — no body write. A real retitle still resets the
+        // freshness clock and lands a witnessed `retitle` event; it does NOT accrete.
+        if (retitled) {
+          await writeFrontmatterField(abs, 'title', JSON.stringify(newTitle)); // record title lives in frontmatter
+          await writeFrontmatterField(abs, 'revised', revisionStamp()); // a retitle is a revision
+          await board.elaborated(target, 'record', 'retitle');
+        }
+        return { record: piece.record, rel: relPath, wrote: false, retitled };
+      }
       const prev = await readFile(abs, 'utf8');
-      await writeFile(abs, `${prev.replace(/\s+$/, '')}\n\n${content.trim()}\n`, 'utf8');
+      // Append-drift accretion (note:append-drift): appends-since-last-consolidation.
+      // The count lives in the LOG now — each body write witnesses an `Elaborated`
+      // event (below), and foldAccretion derives the signal on demand; the retired
+      // `appends` frontmatter counter is gone (a bare counter in every .md file has no
+      // semantic value to a cold reader — initiative:counter-append-drift). The nudge
+      // is an ADVISORY hint at the decision point — never a block, prompt, or exit-code
+      // change; it fires from the fold once accretion has built up.
+      if (replace) {
+        const m = prev.match(/^---\n[\s\S]*?\n---\n?/);
+        const head = m ? m[0] : '';
+        await writeFile(abs, `${head}${content.trim()}\n`, 'utf8');
+      } else {
+        await writeFile(abs, `${prev.replace(/\s+$/, '')}\n\n${content.trim()}\n`, 'utf8');
+      }
+      if (retitled) await writeFrontmatterField(abs, 'title', JSON.stringify(newTitle)); // the retitle rides the same consolidation
       await writeFrontmatterField(abs, 'revised', revisionStamp()); // revisiting resets the freshness clock
-      return { record: piece.record, rel: relPath, wrote: true };
+      await board.elaborated(target, 'record', replace ? 'replace' : 'append', { retitled });
+      // Accretion for this ref, folded from the log (includes the event just written).
+      const accretion = foldAccretion(await board.events()).get(target) ?? 0;
+      return { record: piece.record, rel: relPath, wrote: true, replaced: !!replace, retitled, accretion };
     }
     throw new Error(`elaborate: "${ref}" not found`);
   }
   const retitled = !!(title?.trim() && title.trim() !== card.title);
-  if (retitled) card = await board.retitle(card.id, title.trim());
+  if (retitled) card = await board.retitle(card.id, title.trim(), { pinned: true });
+  const wasBound = !!card.binding?.path;
   const rel = await ensureCardDoc({ board, dir }, card);
+  // ensureCardDoc may have just bound — the in-memory card still lacks binding.path.
+  // Refresh so same-call follow-ups (CLI elaborate --slug → applyReslug) can rename
+  // the freshly materialized doc; without this, applyReslug sees no binding and
+  // only re-pins the handle while the file stays at the old slug path.
+  if (!wasBound) card = (await board.card(card.id)) ?? card;
+  const abs = resolve(dir, rel);
+  if (retitled) await writeFrontmatterField(abs, 'title', JSON.stringify(card.title)); // the doc's frontmatter follows the correction
   if (content.trim()) {
-    await writeFile(resolve(dir, rel), `${newFrontmatter({ kanbento_id: card.id, title: card.title })}${content.trim()}\n`, 'utf8');
-  } else if (retitled) {
-    await writeFrontmatterField(resolve(dir, rel), 'title', JSON.stringify(card.title)); // title-only: the doc's frontmatter follows, the body stays
+    if (replace) {
+      // Deliberate rewrite: rebuild the doc fresh, dropping the prior body (the old default).
+      await writeFile(abs, `${newFrontmatter({ kanbento_id: card.id, title: card.title })}${content.trim()}\n`, 'utf8');
+    } else {
+      // Append — read-then-add, mirroring the record branch (frontmatter is preserved
+      // as part of prev; a bodyless card gains one clean separator, no leading blanks).
+      // AC#4 decision: the append-drift nudge is EXCLUDED here. It scopes to knowledge-
+      // layer records (capability/strategy/…) — durable, context-served docs that decay
+      // (note:append-drift). A card's bound doc is an ephemeral working artifact tied to
+      // the card's lifecycle (archived/removed with the card), so consolidation pressure
+      // doesn't apply; no nudge. The body write is still witnessed (below) so the log
+      // carries the audit dimension for card elaborations too.
+      const prev = await readFile(abs, 'utf8');
+      await writeFile(abs, `${prev.replace(/\s+$/, '')}\n\n${content.trim()}\n`, 'utf8');
+    }
+    // Witness the body write ONCE per elaborate call — append or --replace alike. A call
+    // that also retitles/binds still fires its CardRetitled/CardBound (different facts,
+    // not double-witnessing); this is the single Elaborated event for the body itself.
+    await board.elaborated(card.id, 'card', replace ? 'replace' : 'append');
   }
-  return { card, rel, wrote: !!content.trim(), retitled };
+  return { card, rel, wrote: !!content.trim(), retitled, replaced: !!(replace && content.trim()) };
 }
 
 // The world-state a reaffirmation was checked against: the full HEAD sha, namespaced
@@ -412,20 +589,203 @@ export async function reaffirmCard({ board, dir }, ref) {
   return { record, verified };
 }
 
+// `graduate` — flip a flow:false record's status through the CLI, appending an
+// identity-stamped witness instead of a bare frontmatter hand-edit. The status
+// field is fs-owned (like a record's whole frontmatter), so the WRITE is the store;
+// the RecordGraduated event is the AUDIT TRAIL — "who armed procedure:issue-dedup to
+// `trusted`, and when" answerable from the log alone (the instructor effect gate greps
+// `status: trusted`, so provenance matters). Mirrors reaffirm: records only (a flow
+// card's status is its stage/transition — reaffirm's card guard teaches the same). The
+// target is validated against the record TYPE's declared status vocabulary — an unknown
+// status is refused, never written. Does NOT touch `verified` (the reaffirm check clock)
+// or `revised` (the elaborate edit clock): graduation is its own axis, distinct from
+// both. Idempotent no-op when already at the target (no event, no write).
+export async function graduateRecord({ board, dir }, ref, toStatus) {
+  const to = String(toStatus ?? '').trim();
+  if (!to) throw new Error('graduate: a target status is required — graduate <record> <status>');
+  const piece = await resolvePiece({ board, dir }, ref);
+  if (!piece) throw new Error(`graduate: "${ref}" matches no record`);
+  if (piece.kind === 'card') {
+    throw new Error(`graduate: "${ref}" is a flow card — a card's status is its stage; move it with transition/commit, not graduate (graduate is for records)`);
+  }
+  const record = piece.record;
+  const def = typeDef(board.manifest, record.type);
+  const vocab = vocabTerms(def?.status?.values);
+  if (!vocab.length) {
+    throw new Error(`graduate: type "${record.type}" declares no status vocabulary — nothing to graduate against`);
+  }
+  if (!vocab.includes(to)) {
+    throw new Error(`graduate: "${to}" is not a valid ${record.type} status — declared: ${vocab.join(', ')}`);
+  }
+  const field = def.status?.field ?? 'status';
+  const from = record.status ?? null;
+  if (from === to) return { record, from, to, changed: false }; // already there — no witness, no write
+  const event = await board.graduate(record.curie, from, to, { field });
+  const abs = resolve(dir, record.path);
+  await writeFrontmatterField(abs, field, to); // the store; verified/revised untouched
+  return { record, from, to, changed: true, event };
+}
+
+// `scope` — assign, reassign, or heal a card's product scope. One verb, one
+// invariant: placement follows scope. With a value: set the field (validated
+// against the resolved vocabulary) and move the bound doc to the current
+// template. Without a value: HEAL — place the bound doc for the card's current
+// scope (null → data/cards/ on a scope-declaring board). Idempotent no-op when
+// the field and the path are already right. A headless card still takes the
+// field (next ensureCardDoc lands in the right place); heal with no doc is a
+// teaching error. `unscoped` and `*` are not assignable.
+export async function scopeCard({ board, dir }, ref, value) {
+  const scopes = resolveScopes(board.manifest, dir);
+  if (!scopes) {
+    throw new Error('scope: this board declares no scope vocabulary (manifest `scope:`, e.g. scope: apps/*) — the axis is off; there is nothing to assign or place');
+  }
+  const card = await board.card(ref);
+  if (!card) {
+    const piece = await resolvePiece({ board, dir }, ref);
+    if (piece?.kind === 'record') {
+      throw new Error(`scope: "${ref}" is a record — records re-scope via frontmatter scope: + kanbento sweep (this verb is for cards)`);
+    }
+    throw new Error(`scope: card "${ref}" not found`);
+  }
+  if (card.archived) throw new Error(`scope: card is archived (${card.disposition ?? 'frozen'}) — read-only`);
+
+  const raw = value == null ? '' : String(value).trim();
+  const assign = raw !== '';
+  let next = cardScope(card);
+
+  if (assign) {
+    if (raw === '*') {
+      throw new Error('scope: "*" is star-scope (the whole axis), not a card assignment — a card carries at most one scope; pick a vocabulary id');
+    }
+    if (raw === 'unscoped') {
+      throw new Error('scope: "unscoped" is not assignable — it is the null-queue sentinel. Assign a vocabulary id, or run `kanbento scope <ref>` (no value) to place an unscoped card');
+    }
+    assertScope(scopes, raw, 'scope');
+    next = raw;
+  }
+
+  const dest = card.binding?.path ? expectedCardDocPath(board.manifest, card, next) : null;
+  const from = cardScope(card);
+  const alreadyScoped = from === next;
+  const alreadyPlaced = !card.binding?.path || card.binding.path === dest;
+
+  if (!assign && !card.binding?.path) {
+    throw new Error(`scope: "${ref}" has no bound doc to place — assign a scope with \`kanbento scope <ref> <s>\` (the field still sets; the next materialize lands in the right place), or elaborate first so there is a doc to move`);
+  }
+  if (alreadyScoped && alreadyPlaced) {
+    return { card, scope: next, from, path: card.binding?.path ?? null, changed: false };
+  }
+
+  let path;
+  if (card.binding?.path && dest && dest !== card.binding.path) {
+    const srcAbs = resolve(dir, card.binding.path);
+    const destAbs = resolve(dir, dest);
+    if (!existsSync(srcAbs)) {
+      throw new Error(`scope: bound doc ${card.binding.path} is missing on disk`);
+    }
+    if (existsSync(destAbs)) {
+      throw new Error(`scope: ${dest} already exists — not overwriting`);
+    }
+    await mkdir(dirname(destAbs), { recursive: true });
+    await rename(srcAbs, destAbs);
+    path = dest;
+  }
+
+  const updated = await board.scope(card.id, next, { path });
+  return { card: updated, scope: next, from, path: path ?? updated.binding?.path ?? null, changed: true };
+}
+
 // Apply a refined slug: rename the one bound doc to match when it safely can (a
 // single fresh file, never an --all sweep), then re-slug the card. Returns the
 // updated card and the new doc path (undefined when the doc stayed put).
-export async function applyReslug({ board, dir }, card, slug) {
+//
+// Two modes:
+//   - default (model auto-sharpener): soft on collision — leave the doc, still
+//     sharpen the handle (the slug is advisory; id is the key).
+//   - pinned:true (explicit elaborate --slug, mirrors capture --slug): the
+//     operator's word is sacred — sanitize via explicitSlug (never cap), a
+//     target-path collision fails loudly (never silent uniquify), and the
+//     CardSlugged event carries the pinned slug even when overriding a prior pin.
+export async function applyReslug({ board, dir }, card, slug, { pinned = false } = {}) {
+  if (pinned) slug = explicitSlug(slug); // operator's word: sanitize charset, never silently cap
   let path;
   if (card.binding?.path) {
     const oldRel = card.binding.path;
     const newRel = join(dirname(oldRel), slug + (extname(oldRel) || '.md'));
-    if (newRel !== oldRel && !existsSync(resolve(dir, newRel))) {
-      try { await rename(resolve(dir, oldRel), resolve(dir, newRel)); path = newRel; } catch { /* leave the doc; still sharpen the handle */ }
+    if (newRel !== oldRel) {
+      if (existsSync(resolve(dir, newRel))) {
+        // Pinned collision is loud (capture --slug precedent at embodimentArtifact);
+        // model-derived stays soft — leave the doc, still sharpen the handle below.
+        if (pinned) throw new Error(`slug "${slug}" is taken — ${newRel} already exists; choose another --slug`);
+      } else {
+        try {
+          await rename(resolve(dir, oldRel), resolve(dir, newRel));
+          path = newRel;
+        } catch (err) {
+          if (pinned) throw err; // pinned: rename failure is the user's problem, not silent
+          /* model path: leave the doc; still sharpen the handle */
+        }
+      }
     }
   }
-  const updated = await board.reslug(card.id, slug, { path });
+  const updated = await board.reslug(card.id, slug, { path, pinned });
   return { updated, path };
+}
+
+// Fold one card into another and dispose the loser's bound doc. Kernel merge is
+// append-only (CardsMerged; the loser folds out of the projection). The file is
+// this layer's job, same split as applyReslug.
+//
+// Empty / frontmatter-only loser docs are deleted. A doc with a real body fails
+// loudly and atomically (no event, file untouched) unless discardDoc — unique
+// uncommitted prose is not recoverable from git. Never concatenates bodies.
+export async function mergeCards({ board, dir }, from, into, { title, discardDoc = false } = {}) {
+  const loser = await board.card(from);
+  if (!loser) throw new Error(`merge: card "${from}" not found`);
+  const rel = loser.binding?.path;
+  const abs = rel ? resolve(dir, rel) : null;
+  if (abs && existsSync(abs) && !discardDoc) {
+    const { body } = await readFrontmatter(abs);
+    if (String(body ?? '').trim()) {
+      throw new Error(`merge: ${rel} still holds body — fold it into the survivor by hand, or re-run with --discard-doc`);
+    }
+  }
+  const card = await board.merge(from, into, { title });
+  let dropped = null;
+  if (abs && existsSync(abs)) {
+    await unlink(abs);
+    dropped = rel;
+  }
+  return { card, dropped };
+}
+
+// Files that claim to be card bound docs: untyped card paths plus embodied flow
+// artifacts. Used by lint to find a kanbento_id no live card answers (a merge leftover).
+export async function indexCardBoundDocs(manifest, root) {
+  const out = [];
+  const seen = new Set();
+  const take = async (pattern, exclude) => {
+    for (const path of await indexDocs(root, pattern, exclude)) {
+      if (seen.has(path)) continue;
+      seen.add(path);
+      let data;
+      try {
+        ({ data } = await readFrontmatter(join(root, path)));
+      } catch {
+        continue; // advisory: one corrupt file must not abort the walk
+      }
+      const id = data?.kanbento_id;
+      if (id) out.push({ path, identity: String(id) });
+    }
+  };
+  await take('.kanbento/cards/*.md');
+  await take('.kanbento/data/cards/*.md');
+  await take('.kanbento/data/*/cards/*.md');
+  for (const def of embodiedTypes(manifest).filter(isFlowType)) {
+    const { pattern, exclude } = artifactIndex(def);
+    await take(pattern, exclude);
+  }
+  return out;
 }
 
 // --- procedures: the third command class (skills / do) ----------------------
@@ -446,9 +806,23 @@ export const PROCEDURE_TYPE = 'procedure';
 // to THIS module, never the board dir — they travel with the install, not the repo.
 const BUILTIN_PROCEDURES_DIR = fileURLToPath(new URL('../procedures/', import.meta.url));
 
-function procedureDef(manifest) {
-  const def = typeDef(manifest, PROCEDURE_TYPE);
-  return def && def.embodiment && def.embodiment !== 'none' ? def : null;
+// Every board-local runnable record, merged across ALL runnable types (each type has
+// its own path/embodiment; a record's curie stays <type>:<slug>). Within a type the
+// folder-shadows-file rule still applies (localProcedures); ACROSS two runnable types a
+// slug collision resolves by declaration order — first-declared runnable type wins
+// (deterministic manifest order). Empty when no type is flagged runnable.
+async function localRunnables(manifest, dir, opts = {}) {
+  const out = [];
+  const seen = new Set(); // slug already claimed by an earlier (higher-precedence) runnable type
+  for (const def of runnableDefs(manifest)) {
+    for (const r of await localProcedures(def, dir, opts)) {
+      const slug = parseCurie(r.curie)?.slug;
+      if (slug && seen.has(slug)) continue; // an earlier-declared runnable type already owns this slug
+      if (slug) seen.add(slug);
+      out.push(r);
+    }
+  }
+  return out;
 }
 
 // Read the package's built-in procedures into the same record shape indexRecords
@@ -485,6 +859,11 @@ export async function readBuiltins() {
       refs: data.refs ?? null,
       cadence: data.cadence ?? null, // the built-in's rhythm, if it declares one — same as a board record
       runner: data.runner ?? null, // the built-in's declared runner grant, if it declares one — same as a board record
+      params: data.params ?? null, // declared params — engages the runner (validation + interpolation)
+      artifacts: data.artifacts ?? null, // declared run deliverables — validated + disposed at finalize
+      sandbox: data.sandbox ?? null, // --exec sandbox grants — merged over the floor
+      workspace: data.workspace ?? null, // intake mode: fs (default) | worktree — the runner materializes a git checkout + diff-for-free
+      lineage: data.lineage ?? null, // observe-capture source template
       builtin: true,
       body,
     });
@@ -492,11 +871,155 @@ export async function readBuiltins() {
   return out;
 }
 
-// Every file co-located under a folder built-in's `home`, except its procedure.md — the
-// scripts the brief points the runner at. Recursive, sorted, returned as { rel, abs }
-// (relative to home for reading, absolute for running). Fail-soft: an unreadable home
-// yields nothing (the ## Scripts section just omits).
-async function builtinScripts(home) {
+// The harness directories we probe for inbound agent skills — the SEED OF THE ADAPTER
+// REGISTRY. Each agent harness (Claude, Codex, Cursor, Grok, …) parks skills under its own
+// convention dir; the bare `skills/` is the generic fallback, safe because we only admit a
+// subfolder that holds a SKILL.md. Probe order is precedence order: on a slug collision the
+// FIRST dir wins (the symlink convention parks one skill under several harness dirs at once).
+export const HARNESS_SKILL_DIRS = [
+  '.agents/skills',
+  '.claude/skills',
+  '.codex/skills',
+  '.cursor/skills',
+  '.grok/skills',
+  'skills',
+];
+
+// Discover agent skills living in harness directories under the board root `dir`, into the
+// same record shape readBuiltins yields — so `procedures`/`do` serve them with ZERO install.
+// A skill is a subfolder holding a SKILL.md; slug = folder name; title = frontmatter `name`
+// (folder name if absent). Deduped by slug across probe dirs (first dir wins) AND by the
+// SKILL.md's realpath (the symlink convention fans one file across many dirs). A probe dir
+// that is a symlink resolving INTO the store is skipped, so a future OUTBOUND projection
+// (a skills/ symlink into .kanbento) is never re-discovered as inbound. Fail-soft throughout:
+// a missing/unreadable dir or file is silently skipped, same posture as readBuiltins.
+export async function readHarnessSkills(dir) {
+  // Realpath the store so the symlink-into-store guard compares resolved paths on both sides
+  // (a tmpdir like /var → /private/var would otherwise never match). Fail-soft to the plain path.
+  const store = await realpath(resolve(dir, '.kanbento')).catch(() => resolve(dir, '.kanbento'));
+  const out = [];
+  const bySlug = new Set(); // slug already claimed by an earlier (higher-precedence) probe dir
+  const byReal = new Set(); // SKILL.md realpath already served (symlink fan-out across dirs)
+  for (const probe of HARNESS_SKILL_DIRS) {
+    const base = resolve(dir, probe);
+    // A probe dir that is a symlink pointing into the store is an outbound projection, not an
+    // inbound source — never double-discover it. (realpath throws on a non-symlink/missing path;
+    // that just means probe it normally.)
+    try {
+      const real = await realpath(base);
+      if (real === store || real.startsWith(store + sep)) continue;
+    } catch { /* not a symlink into the store — probe normally */ }
+    let entries;
+    try { entries = await readdir(base, { withFileTypes: true }); }
+    catch { continue; } // missing / unreadable dir — degrade to the other probe dirs
+    for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (!e.isDirectory() && !e.isSymbolicLink()) continue; // a bare file is not a skill folder
+      const slug = e.name;
+      if (bySlug.has(slug)) continue; // an earlier probe dir already owns this slug
+      const skillMd = join(base, slug, 'SKILL.md');
+      if (!existsSync(skillMd)) continue; // a folder without SKILL.md is silently skipped
+      let realMd;
+      try { realMd = await realpath(skillMd); } catch { realMd = skillMd; }
+      if (byReal.has(realMd)) continue; // same file reached via a symlink under another slug/dir
+      let parsed;
+      try { parsed = await readFrontmatter(skillMd); } catch { continue; } // unreadable — skip
+      const { data, body } = parsed;
+      bySlug.add(slug); byReal.add(realMd);
+      out.push({
+        path: skillMd, home: join(base, slug),
+        identity: `harness:${probe}/${slug}`,
+        curie: `skill:${slug}`, // a skill: CURIE — bare-slug and CURIE matching both fall out for free
+        title: data.name ?? slug,
+        description: data.description ?? null, // carried for provenance; not otherwise required
+        type: 'skill',
+        status: null, // a harness skill has no kanbento status axis (trial/trusted is for our procedures)
+        refs: data.refs ?? null,
+        cadence: data.cadence ?? null,
+        runner: data.runner ?? null,
+        params: data.params ?? null, // declared params — engages the runner (validation + interpolation)
+        artifacts: data.artifacts ?? null, // declared run deliverables — validated + disposed at finalize
+        sandbox: data.sandbox ?? null, // --exec sandbox grants — merged over the floor
+        workspace: data.workspace ?? null, // intake mode: fs (default) | worktree — the runner materializes a git checkout + diff-for-free
+        lineage: data.lineage ?? null, // observe-capture source template
+        harness: probe, // the probe dir it was found under (e.g. '.grok/skills') — the origin badge
+        body,
+      });
+    }
+  }
+  return out;
+}
+
+// Discover the board's FOLDER-FORM procedures: .kanbento/procedures/<slug>/SKILL.md —
+// the mini-app shape (frontmatter in SKILL.md, same schema as the file form; a sibling
+// hooks/init and any scripts/references ride along in the folder). The base dir derives
+// from the declared type's path template (the prefix before {slug}), so a board that
+// relocates its procedures keeps both forms co-located. Record discovery (indexRecords)
+// globs only *.md files, so lint/sync/map/sweep simply never see a folder procedure —
+// this reader is the accommodation, feeding listSkills/resolveProcedure directly.
+// Fail-soft like readBuiltins: a folder without SKILL.md is silently skipped.
+// `home` is ABSOLUTE (hooks + the run-dir copy resolve against it); `folder: true`
+// is the runner's gate.
+export async function readFolderProcedures(def, dir) {
+  const cut = (def?.path ?? '').indexOf('{slug}');
+  if (cut < 0) return []; // no {slug} template — nowhere to look for folder siblings
+  const base = def.path.slice(0, cut); // e.g. '.kanbento/procedures/'
+  let entries;
+  try { entries = await readdir(resolve(dir, base), { withFileTypes: true }); }
+  catch { return []; } // no procedures dir yet — nothing authored
+  const out = [];
+  for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!e.isDirectory()) continue;
+    const home = resolve(dir, base, e.name);
+    const md = join(home, 'SKILL.md');
+    if (!existsSync(md)) continue;
+    const { data, body } = await readFrontmatter(md);
+    out.push({
+      path: join(base, e.name, 'SKILL.md'),
+      home,
+      identity: data[def.identity ?? 'kanbento_id'] ?? join(base, e.name),
+      curie: `${def.id}:${e.name}`,
+      // The frontmatter is a UNION of vocabularies (kanbento record keys + Agent Skills
+      // keys like name/description/allowed-tools) — unknown keys are tolerated and, since
+      // the run-dir copy is a byte-for-byte fs.cp and nothing rewrites SKILL.md, preserved.
+      // Display falls back to the Agent Skills `name` when no kanbento `title` is set.
+      title: data.title ?? data.name ?? e.name,
+      description: data.description ?? null,
+      type: def.id,
+      status: data[def.status?.field ?? 'status'] ?? null,
+      verified: data.verified ?? null,
+      revised: data.revised ?? null,
+      refs: data.refs ?? null,
+      cadence: data.cadence ?? null,
+      runner: data.runner ?? null,
+      params: data.params ?? null,
+      artifacts: data.artifacts ?? null, // declared run deliverables — validated + disposed at finalize
+      sandbox: data.sandbox ?? null, // --exec sandbox grants — merged over the floor
+      workspace: data.workspace ?? null, // intake mode: fs (default) | worktree — the runner materializes a git checkout + diff-for-free
+      lineage: data.lineage ?? null, // observe-capture source template
+      folder: true, // folder-form — `do` engages the runner (run dir, hooks, interpolation)
+      marker: 'SKILL.md',
+      body,
+    });
+  }
+  return out;
+}
+
+// The board's local procedures, both forms merged: a folder (<slug>/SKILL.md) SHADOWS
+// a same-slug file (<slug>.md) — `do` resolves the folder form first, the file form
+// is the unchanged legacy fallback.
+async function localProcedures(def, dir, { withBody = false } = {}) {
+  if (!def) return [];
+  const folders = await readFolderProcedures(def, dir);
+  const folderSlugs = new Set(folders.map((r) => parseCurie(r.curie)?.slug).filter(Boolean));
+  const files = (await indexRecords(def, dir, { withBody })).filter((r) => !folderSlugs.has(parseCurie(r.curie)?.slug));
+  return [...folders, ...files];
+}
+
+// Every file co-located under a folder record's `home`, except its marker (procedure.md for a
+// folder built-in, SKILL.md for a harness skill) — the scripts/files the brief points the runner
+// at. Recursive, sorted, returned as { rel, abs } (relative to home for reading, absolute for
+// running). Fail-soft: an unreadable home yields nothing (the section just omits).
+async function folderFiles(home, marker = 'procedure.md') {
   const out = [];
   const walk = async (rel) => {
     let ents;
@@ -504,8 +1027,9 @@ async function builtinScripts(home) {
     catch { return; }
     for (const e of ents.sort((a, b) => a.name.localeCompare(b.name))) {
       const r = rel ? join(rel, e.name) : e.name;
+      if (!rel && e.name === 'hooks' && e.isDirectory()) continue; // runner machinery (hooks/init runs automatically) — not a script for the consumer
       if (e.isDirectory()) { await walk(r); continue; }
-      if (!rel && e.name === 'procedure.md') continue; // the prose itself, not a script
+      if (!rel && e.name === marker) continue; // the prose itself, not a co-located file
       out.push({ rel: r, abs: join(home, r) });
     }
   };
@@ -565,16 +1089,24 @@ function lastRuns(events) {
 // the built-ins ride the type even with no board records authored yet. lastRan/due
 // fold the ProcedureInvoked log against each record's `cadence:`.
 export async function listSkills({ board, dir }) {
-  const def = procedureDef(board.manifest);
   // Built-ins are versioned with the tool and ride ANY board — even one that declares no
-  // `procedure` type. Only board-local records need the declared type (nothing to index
-  // without it). A local record still SHADOWS a same-slug built-in when the type IS declared.
-  const local = def ? await indexRecords(def, dir) : [];
+  // runnable type. Only board-local records need a runnable type (nothing to index
+  // without one). A local record still SHADOWS a same-slug built-in when a runnable type
+  // IS declared. Discovered across EVERY runnable type, not the hardcoded `procedure`.
+  const local = await localRunnables(board.manifest, dir); // all runnable types; folder shadows same-slug file within each
   const localSlugs = new Set(local.map((r) => parseCurie(r.curie)?.slug).filter(Boolean));
-  const builtins = (await readBuiltins()).filter((b) => !localSlugs.has(parseCurie(b.curie).slug));
+  // Three tiers, slug-keyed: local procedure records > harness skills > built-ins. A harness
+  // skill shadows a same-slug built-in; a local record shadows both (the install-a-workflow
+  // precedent — ship/discover, then let the board own its override).
+  const harness = (await readHarnessSkills(dir)).filter((h) => !localSlugs.has(parseCurie(h.curie).slug));
+  const harnessSlugs = new Set(harness.map((h) => parseCurie(h.curie).slug));
+  const builtins = (await readBuiltins()).filter((b) => {
+    const slug = parseCurie(b.curie).slug;
+    return !localSlugs.has(slug) && !harnessSlugs.has(slug);
+  });
   const runs = lastRuns(await board.events());
   const out = [];
-  for (const r of [...local.map((r) => ({ ...r, builtin: false })), ...builtins]) {
+  for (const r of [...local.map((r) => ({ ...r, builtin: false })), ...harness, ...builtins]) {
     const lastRan = runs.get(r.curie) ?? null;
     const slug = parseCurie(r.curie)?.slug ?? null;
     out.push({
@@ -583,12 +1115,31 @@ export async function listSkills({ board, dir }) {
       status: r.status ?? null,
       title: r.title,
       builtin: !!r.builtin,
+      harness: r.harness ?? null, // the harness dir a discovered skill rode in on (null for locals/builtins)
       lastRan, // ISO of the latest ProcedureInvoked for this curie, or null (never invoked)
       due: await procedureDue(parseCadence(r.cadence), lastRan, dir),
       schedule: await readScheduleState(slug, board.manifest?.board?.id, dir), // this board's OS-scheduler stamp, if registered
+      runs: slug ? await runWitness(dir, slug) : { count: 0, last: null }, // runner invocations witnessed under .kanbento/runs/<slug>/
     });
   }
   return out.sort((a, b) => (a.slug ?? a.curie ?? '').localeCompare(b.slug ?? b.curie ?? ''));
+}
+
+// CURIEs the runner can resolve (board-local runnables ▸ harness skills ▸ package
+// built-ins), same three-tier shadow chain as listSkills/resolveProcedure. Used by
+// lint's dangling check so a plan's `about procedure:replenish` is not a false
+// positive when replenish is a package built-in (story:lint-builtin-procedure-refs).
+// Local same-slug records shadow harness and built-ins (one curie in the set).
+export async function runnableKnownCuries(manifest, dir) {
+  const local = await localRunnables(manifest, dir);
+  const localSlugs = new Set(local.map((r) => parseCurie(r.curie)?.slug).filter(Boolean));
+  const harness = (await readHarnessSkills(dir)).filter((h) => !localSlugs.has(parseCurie(h.curie).slug));
+  const harnessSlugs = new Set(harness.map((h) => parseCurie(h.curie).slug));
+  const builtins = (await readBuiltins()).filter((b) => {
+    const slug = parseCurie(b.curie).slug;
+    return !localSlugs.has(slug) && !harnessSlugs.has(slug);
+  });
+  return new Set([...local, ...harness, ...builtins].map((r) => r.curie).filter(Boolean));
 }
 
 // Resolve a procedure <name> (CURIE or bare slug) to its record — board-first, then
@@ -596,21 +1147,29 @@ export async function listSkills({ board, dir }) {
 // (assembleBrief) and `did` (registerRun) so both resolve identically and error the
 // same teaching way on an unknown name. withBody so a brief renderer gets the text.
 export async function resolveProcedure({ board, dir }, name, { verb = 'do' } = {}) {
-  const def = procedureDef(board.manifest);
   // Built-ins resolve on ANY board (they ship with the tool). Only board-local records
-  // need the declared type; a local record shadows a same-slug built-in when it is declared.
-  const local = def ? await indexRecords(def, dir, { withBody: true }) : [];
+  // need a runnable type; a local record shadows a same-slug built-in. Resolved across
+  // EVERY runnable type, not the hardcoded `procedure` — a wider search set, same mechanics.
+  const local = await localRunnables(board.manifest, dir, { withBody: true }); // all runnable types; folder shadows same-slug file within each
   const localSlugs = new Set(local.map((r) => parseCurie(r.curie)?.slug).filter(Boolean));
-  const builtins = (await readBuiltins()).filter((b) => !localSlugs.has(parseCurie(b.curie).slug));
+  // Same three-tier shadow chain as listSkills: local records > harness skills > built-ins.
+  // Harness skills resolve on ANY board (like built-ins — a `skill:` CURIE, no declared type).
+  const harness = (await readHarnessSkills(dir)).filter((h) => !localSlugs.has(parseCurie(h.curie).slug));
+  const harnessSlugs = new Set(harness.map((h) => parseCurie(h.curie).slug));
+  const builtins = (await readBuiltins()).filter((b) => {
+    const slug = parseCurie(b.curie).slug;
+    return !localSlugs.has(slug) && !harnessSlugs.has(slug);
+  });
   const curie = parseCurie(name);
   const match = (recs) => recs.filter((r) => (curie ? r.curie === name : r.curie?.endsWith(`:${name}`) || r.curie === name));
-  // board-first: a local record shadows a built-in of the same slug — resolve against
-  // the board, and only fall through to the built-ins when nothing local matched.
+  // board-first: a local record shadows a harness skill / built-in of the same slug — resolve
+  // against the board, fall through to harness skills, then built-ins, in precedence order.
   let matches = match(local);
+  if (!matches.length) matches = match(harness);
   if (!matches.length) matches = match(builtins);
   if (matches.length > 1) throw new Error(`${verb}: "${name}" is ambiguous — ${matches.map((m) => m.curie).join(', ')}`);
   if (!matches.length) {
-    const avail = [...local, ...builtins].map((r) => r.curie).filter(Boolean).sort();
+    const avail = [...local, ...harness, ...builtins].map((r) => r.curie).filter(Boolean).sort();
     throw new Error(
       `${verb}: "${name}" matches no procedure — ${avail.length ? `available: ${avail.join(', ')}` : 'none authored yet (write one with `kanbento note --type procedure`)'}`,
     );
@@ -635,8 +1194,10 @@ function caseCuriesIn(rec) {
 // case file's content (the knowing-when), and a footer of the record's other refs as
 // pointers. Resolves <name> by CURIE or bare slug, mirroring resolvePiece's idiom.
 // Returns { record, text, cases, pointers } so a test can assert on the parts.
-export async function assembleProcedure({ board, dir }, name) {
-  const rec = await resolveProcedure({ board, dir }, name);
+// `record` (optional) skips re-resolution — the runner passes the already-resolved
+// record back with its ${...} slots interpolated, keeping the served shape identical.
+export async function assembleProcedure({ board, dir }, name, { record = null } = {}) {
+  const rec = record ?? await resolveProcedure({ board, dir }, name);
   const deprecated = rec.status === 'deprecated';
 
   // Pull the content of every case file the procedure cites (refs or body). A CURIE that
@@ -659,18 +1220,24 @@ export async function assembleProcedure({ board, dir }, name) {
       return { rel: e.rel, curie: e.curie, where };
     });
 
+  const isSkill = rec.type === 'skill';
   const out = [];
   out.push(`# ${rec.title}`);
-  out.push(`procedure: ${rec.curie}${rec.status ? ` · status: ${rec.status}` : ''}`);
+  // A harness skill shows its inbound provenance (skill @ <harness>/<slug>) in place of the
+  // trial/trusted status a kanbento procedure carries — a skill has no such status axis.
+  if (isSkill) out.push(`${rec.curie} · skill @ ${rec.harness}/${parseCurie(rec.curie).slug}`);
+  else out.push(`procedure: ${rec.curie}${rec.status ? ` · status: ${rec.status}` : ''}`);
   if (deprecated) out.push('', '⚠ DEPRECATED — do NOT follow this procedure as-is; it has been superseded. See its replacement before acting.');
   out.push('', String(rec.body ?? '').trim());
-  // Folder built-ins ship deterministic extraction scripts next to the prose — list them
-  // so the runner invokes the shipped code verbatim instead of reinventing the extraction.
+  // A folder record ships co-located files next to the prose — list them so the executing agent
+  // can find them. A folder built-in calls them Scripts (deterministic extraction, run verbatim);
+  // a harness skill calls them Files (ENVIRONMENT.md, scripts/, … read/run as the skill directs).
   if (rec.home) {
-    const scripts = await builtinScripts(rec.home);
-    if (scripts.length) {
-      out.push('', '## Scripts', '', 'Co-located scripts — run them verbatim (they exist so extraction is deterministic); do not reimplement them.');
-      for (const s of scripts) out.push(`- ${s.rel} — ${s.abs}`);
+    const files = await folderFiles(rec.home, rec.marker ?? (isSkill ? 'SKILL.md' : 'procedure.md'));
+    if (files.length) {
+      if (isSkill) out.push('', '## Files', '', 'Co-located files in the skill folder — read or run them as the skill directs (e.g. ENVIRONMENT.md, scripts/).');
+      else out.push('', '## Scripts', '', 'Co-located scripts — run them verbatim (they exist so extraction is deterministic); do not reimplement them.');
+      for (const f of files) out.push(`- ${f.rel} — ${f.abs}`);
     }
   }
   if (cases.length) {
@@ -695,8 +1262,10 @@ export async function assembleProcedure({ board, dir }, name) {
   // The epistemic contract travels with the served procedure, status-aware: deviation is a
   // contradiction detector (instruction vs context can't both be right), not
   // disobedience — a draft invites deviation-plus-report (it's on trial); a trusted
-  // procedure asks for escalation first. Deprecated already warned above the body.
-  if (!deprecated) {
+  // procedure asks for escalation first. Deprecated already warned above the body. A harness
+  // skill is external code with no kanbento status axis — the trial/trusted contract is about
+  // OUR authored procedures, so it does not apply (the skill's own body governs it).
+  if (!deprecated && !isSkill) {
     out.push('', '---', '');
     out.push(
       rec.status === 'trusted'

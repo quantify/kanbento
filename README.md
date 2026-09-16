@@ -24,7 +24,7 @@ kanbento transition login-fix in_progress
 kanbento transition login-fix done
 ```
 
-Every command appends events to `.kanbento/events.jsonl` and re-renders
+Every command appends events to `.kanbento/data/events.jsonl` and re-renders
 `.kanbento/views/BOARD.md` — a markdown map of every card and where it sits.
 Humans read the views; agents read them too, then act through the CLI.
 
@@ -55,8 +55,8 @@ grammar. The default flow (`--template 4`; rung 5 adds an `↻` acceptance
 checkpoint before delivery):
 
 ```
-○ backlog  →  ◆ selected  →  ▶ in_progress  →  ✓ done
-  options     commit          active            delivered
+○ pool  →  ◆ selected  →  ▶ in_progress  →  ✓ done
+  options   commit          active            delivered
 ```
 
 - `○` **options** — captured, uncommitted, discardable. Capture freely; the
@@ -79,6 +79,16 @@ kanbento capture "fix the flaky auth test" --type bug      # a flow card
 kanbento note "retry backoff decision" --slug retry-policy # knowledge, no stage
 kanbento elaborate retry-policy -F decision.md             # give it a body
 ```
+
+A card's title and slug are **model-sharpened in the background**: after
+`capture` returns, a detached pass asks `claude -p --model haiku` for a subject
+handle and appends the result to the log (`fix the flaky auth test` may become
+`flaky-auth-test`). Anything you pin with `--slug` / `--title` stays; the
+id is the key, so the handle can change without anything breaking. Set
+`KANBENTO_NO_NAMING=1` to turn it off (CI, bulk imports, no Claude CLI on the
+box — it degrades silently to the heuristic name), or point `nameEvaluator:` in
+the manifest at any command that reads `$KANBENTO_PROMPT` and prints
+`{"title","slug"}`.
 
 Flow types (`story`, `bug`, yours) move through stages. **Record types** you
 declare in the manifest (`flow: false`) are the knowledge layer: each record is
@@ -111,12 +121,14 @@ kanbento do curate         # print one: instructions + precedents + pointers
 A **procedure** is executable knowledge — a recipe an agent runs with judgment,
 not a script. Procedures are markdown records with an optional `cadence:`
 (`7d`, `20 commits`); invocations are logged, so due-ness is derived, not
-scheduled. Three built-ins ship with the CLI: `pulse` (orient: what needs
-attention), `curate` (knowledge upkeep), and `status-update` (draft an outbound
+scheduled. Built-ins ship with the CLI: `pulse` (orient: what needs
+attention), `curate` (knowledge upkeep), `status-update` (draft an outbound
 status report from local evidence — git + board events — for the human to
-approve and send). A built-in can be a folder co-locating deterministic
-extraction scripts with the prose. Boards add their own, and a local procedure
-with a built-in's name overrides it.
+approve and send), plus an upstream set — `replenish`, `prep`, `explore`,
+`design`, `settle`, `steer` — that triages the pool, readies cards, and books
+outcomes. A built-in can be a folder co-locating deterministic extraction
+scripts with the prose. Boards add their own, and a local procedure with a
+built-in's name overrides it.
 
 Harness-independent by construction: any agent that can run a CLI can run
 `kanbento do pulse` — or be pointed at it with `claude -p "kanbento do pulse"`.
@@ -143,7 +155,8 @@ the prompt appended at the end) plus per-procedure overrides (`procedures.<slug>
 
 ```bash
 kanbento cases taxonomy    # the decision categories this board has learned
-kanbento cases retain discard-junk-capture --about a1b2c3 --why "..."
+kanbento cases retain discard-junk-capture --rel about=a1b2c3 --why "..." \
+    --when "a capture with no subject and no owner"   # --when only for a NEW category
 ```
 
 When an operator (human or agent) makes a judgment call, it can be retained as
@@ -165,6 +178,16 @@ kanbento map                        # per-record graph views + curation queue
 `reaffirm` stamps a record with `verified: git:<sha>`; the curation view ranks
 records by code churn since their last verification, so knowledge that has
 drifted from reality surfaces first.
+
+```bash
+kanbento worktree open login-fix    # a card-scoped branch + worktree, reused across the flow
+kanbento worktree diff login-fix    # base..branch — the reviewer's subject
+kanbento worktree remove login-fix  # explicit teardown at done / abandon
+```
+
+A card can own a persistent git worktree: verbs run from inside it are routed
+to the main board (a gitdir-style pointer file), so an agent working on a
+branch sees and moves the same cards as everyone else.
 
 ## Working across boards
 
@@ -199,17 +222,22 @@ The essentials:
 | `init` | create a board (manifest + guide + anchors) |
 | `capture` / `note` | add work to the inbox / add knowledge to the layer |
 | `commit` / `transition` / `archive` | move cards; cross the commitment point |
-| `elaborate` / `link` / `refs` | bodies, typed edges, backlinks |
+| `elaborate` / `link` / `unlink` / `refs` | bodies, typed edges, backlinks |
+| `checklist` | a card's named checklists (Acceptance Criteria, gate items) |
+| `search` | ranked recall over every card, record, and vendored doc stub |
+| `scope` | assign a card's product scope (boards that declare `scope:`) |
+| `worktree` | open / diff / remove a card-scoped git worktree |
 | `procedures` / `do` | list / run executable knowledge |
 | `cases` | decision taxonomy + precedents |
-| `reaffirm` / `map` / `lint` | verification stamps, graph views, conventions check |
+| `reaffirm` / `graduate` / `map` / `lint` | verification stamps, status graduation, graph views, conventions check |
+| `metrics` | flow metrics folded from the event log (`views/METRICS.md`) |
 | `request` / `network` | cross-board requests and views |
 | `board` / `pool` / `card` / `events` | read state at any granularity |
-| `schema` / `compile` / `diff` / `reconcile` | the manifest and its evolution |
+| `schema` / `compile` / `diff` / `reconcile` / `upgrade` | the manifest and its evolution |
 
 ## Requirements
 
-Node.js ≥ 22. Git is optional but recommended — worktree stamps,
+Node.js ≥ 22.12 (the test suite also runs green on Bun). Git is optional but recommended — worktree stamps,
 principal attribution, and verification pins degrade gracefully without it.
 
 ## License

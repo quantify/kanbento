@@ -1,7 +1,10 @@
 import { mkdir, writeFile, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { stages, commitStageId, nextStageId, lanes, laneValue, portfolioTypes, typeDef, vocabTerms } from './manifest.js';
+import { stages, commitStageId, nextStageId, lanes, laneValue, portfolioTypes, typeDef, vocabTerms, isFlowType } from './manifest.js';
+import { refEdges, refTarget } from './refs.js';
+import { summary } from './kernel.js';
 import { GLYPH, DISPOSITIONS } from './protocol.js';
+import { acBadge, reworkBadge } from './checklist.js';
 
 // A file-based projection of board state — the materialized READ model.
 //
@@ -38,10 +41,23 @@ function partition(manifest) {
   };
 }
 
+// Board-wide loop ceiling: max of maxIterations across loop-kind flows (null when none set).
+// Used by the ↺ badge so a card shows ↺1/2 when the budget is knowable from the manifest.
+export function loopCeiling(manifest) {
+  let max = null;
+  for (const f of manifest.flows ?? []) {
+    if (f.kind === 'loop' && f.maxIterations != null) {
+      max = max == null ? f.maxIterations : Math.max(max, f.maxIterations);
+    }
+  }
+  return max;
+}
+
 // Render BOARD.md — the focus view. Pure (pass `now` for a deterministic render).
 export function renderBoard(cards, manifest, { now = Date.now(), filter = null } = {}) {
   const board = manifest.board ?? {};
   const laneDefs = lanes(manifest);
+  const loopMax = loopCeiling(manifest);
   cards = cards.filter((c) => !c.archived); // frozen cards drop off the active board -> ARCHIVE.md
   if (filter) {
     const def = laneDefs.find((d) => d.axis === filter.axis) ?? { axis: filter.axis, from: filter.axis };
@@ -61,16 +77,16 @@ export function renderBoard(cards, manifest, { now = Date.now(), filter = null }
   // the board, normal flow: intake (top) -> delivery (bottom)
   out.push('## Board', '');
   if (!collapse) {
-    for (const stage of ordered) out.push(...stageSection(stage, byStage, now, laneDefs));
+    for (const stage of ordered) out.push(...stageSection(stage, byStage, now, laneDefs, loopMax));
   } else {
     if (preCommit.length) out.push(...collapsedOptions(preCommit, byStage));
-    for (const stage of middle) out.push(...stageSection(stage, byStage, now, laneDefs));
-    for (const stage of done) out.push(...truncatedDone(stage, byStage, now, laneDefs));
+    for (const stage of middle) out.push(...stageSection(stage, byStage, now, laneDefs, loopMax));
+    for (const stage of done) out.push(...truncatedDone(stage, byStage, now, laneDefs, loopMax));
   }
 
   if (orphans.length) {
     out.push('## ⚠ Orphaned (state no longer in the manifest — run `reconcile`)', '');
-    for (const c of orphans) out.push(`- ${cardLine(c, null, now)} — _was in \`${c.state}\`_`);
+    for (const c of orphans) out.push(`- ${cardLine(c, null, now, '', loopMax)} — _was in \`${c.state}\`_`);
     out.push('');
   }
   return out.join('\n').replace(/\n+$/, '\n');
@@ -83,17 +99,102 @@ export function renderPool(cards, manifest, { now = Date.now() } = {}) {
   if (!collapse || !preCommit.length) return null;
   const board = manifest.board ?? {};
   const laneDefs = lanes(manifest);
+  const loopMax = loopCeiling(manifest);
   const byStage = groupBy(cards.filter((c) => !c.archived), (c) => c.state);
   const out = [`# ${board.name ?? board.id ?? 'board'} · pool`, ''];
   out.push('> the full Options pool — pre-commitment, FIFO (oldest first). Back to [BOARD.md](BOARD.md).', '');
-  for (const stage of preCommit) out.push(...stageSection(stage, byStage, now, laneDefs));
+  // The summary header — a per-territory rollup ABOVE the FIFO list, so a cold-start
+  // agent orients from clusters, not 100+ raw edges. Folded from the same card store
+  // (no new store, no query) over exactly the Options pool.
+  const poolCards = preCommit.flatMap((s) => byStage.get(s.id) ?? []);
+  out.push(...poolSummary(poolCards, manifest, now));
+  // Stage vocabulary only earns its place when the board declares SEVERAL
+  // options-role stages — then "which options stage" is a real question and each
+  // gets its own `###` section (the CLI's per-line marker, in markdown form).
+  // A single-options board (the common shape) has no such distinction: render a
+  // flat FIFO list with NO stage header — don't show vocabulary the board lacks.
+  const optionsStages = preCommit.filter((s) => s.role === 'options');
+  if (optionsStages.length > 1) {
+    for (const stage of preCommit) out.push(...stageSection(stage, byStage, now, laneDefs, loopMax));
+  } else {
+    const flat = poolCards.slice().sort((a, b) => ts(a.updatedAt) - ts(b.updatedAt)); // FIFO, oldest first
+    for (const c of flat) out.push('- ' + cardLine(c, null, now, laneLabel(c, laneDefs), loopMax));
+    out.push('');
+  }
   return out.join('\n').replace(/\n+$/, '\n');
+}
+
+// A ref target resolves to a knowledge-layer record when its type is a declared (or
+// builtin) type with `flow: false` — capability, strategy, note, case, … A card-to-card
+// edge (sibling → story:…, parent → …) resolves to a flow card, so it self-excludes:
+// the discriminator is the target's record-ness, NOT a hardcoded relation-key list.
+// An untyped `file:` ref or an unknown type resolves to neither and counts as no
+// territory (falls to unanchored if a card has nothing else).
+function resolvesToRecord(manifest, curie) {
+  const t = refTarget(manifest, curie);
+  if (!t.type) return false;
+  const def = typeDef(manifest, t.type);
+  return !!def && !isFlowType(def);
+}
+
+// The three-block summary header, folded from the pool cards at render time. The
+// reader is an agent that already knows the query surface, so rows carry no
+// drill-down command text — just the cluster and its count. Everything that can't
+// be a query slice (age histograms, per-cluster aging, by-source) stays OUT; that
+// analytics belongs to METRICS.md. Returns [] when the pool is empty.
+function poolSummary(poolCards, manifest, now) {
+  const total = poolCards.length;
+  if (!total) return [];
+  const out = ['## summary', ''];
+
+  // Block 1 — by territory: each card counts once per DISTINCT record-target CURIE, so
+  // a multi-target card lands in each of its buckets; a card with no record target is
+  // unanchored (ref-less, or only card-to-card edges — either way it anchors no position).
+  const territory = new Map();
+  let unanchored = 0;
+  for (const c of poolCards) {
+    const targets = [...new Set(refEdges(c.payload?.refs).map((e) => e.curie))].filter((cur) => resolvesToRecord(manifest, cur));
+    if (!targets.length) { unanchored += 1; continue; }
+    for (const cur of targets) territory.set(cur, (territory.get(cur) ?? 0) + 1);
+  }
+  // Tail-cap the long tail: buckets of 1–3 cards fold into a single `misc` row at
+  // the bottom of the block (N = cards across all folded buckets, M = folded-bucket
+  // count), keeping only the 4+ clusters — the ones worth a named line — in the
+  // count-desc list. `unanchored` is not a territory bucket, so it never folds; it
+  // stays its own row after the folded misc.
+  const FOLD_MIN = 4;
+  const buckets = [...territory.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const kept = buckets.filter(([, n]) => n >= FOLD_MIN);
+  const folded = buckets.filter(([, n]) => n < FOLD_MIN);
+  const miscCards = folded.reduce((s, [, n]) => s + n, 0);
+  out.push('### by territory', '');
+  if (!buckets.length && !unanchored) out.push('- _(none)_');
+  for (const [curie, n] of kept) out.push(`- \`${curie}\` · [${n}]`);
+  if (folded.length) out.push(`- \`misc\` · [${miscCards} cards · ${folded.length} territories]`);
+  if (unanchored) out.push(`- \`unanchored\` · [${unanchored}] — ref-less; feeds no position surface`);
+  out.push('');
+
+  // Block 2 — by type: story/bug/typed mix (the hygiene-vs-feature demand read).
+  const byType = new Map();
+  for (const c of poolCards) byType.set(c.type ?? null, (byType.get(c.type ?? null) ?? 0) + 1);
+  const typeRows = [...byType.entries()].sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])));
+  out.push('### by type', '');
+  for (const [t, n] of typeRows) out.push(t ? `- ${t} · [${n}]` : `- untyped · [${n}]`);
+  out.push('');
+
+  // Block 3 — freshness: one demand-arrival line, no per-line age judgment.
+  const WEEK = 7 * 24 * 60 * 60 * 1000;
+  const touched = poolCards.filter((c) => now - ts(c.updatedAt) <= WEEK).length;
+  const oldest = poolCards.reduce((m, c) => Math.min(m, ts(c.createdAt) || Infinity), Infinity);
+  out.push('### freshness', '', `${total} total · ${touched} touched last 7d · oldest ${Number.isFinite(oldest) ? age(now - oldest) : 'n/a'}`, '');
+  return out;
 }
 
 // DONE.md — the full delivered history, newest first. null unless done has grown
 // past what BOARD.md shows inline (so the file exists iff BOARD.md links to it).
 export function renderDone(cards, manifest, { now = Date.now() } = {}) {
   const laneDefs = lanes(manifest);
+  const loopMax = loopCeiling(manifest);
   const done = stages(manifest).filter((s) => s.role === 'done');
   const byStage = groupBy(cards.filter((c) => !c.archived), (c) => c.state);
   const total = done.reduce((n, s) => n + (byStage.get(s.id)?.length ?? 0), 0);
@@ -106,7 +207,7 @@ export function renderDone(cards, manifest, { now = Date.now() } = {}) {
     const inStage = [...(byStage.get(stage.id) ?? [])].sort((a, b) => ts(b.updatedAt) - ts(a.updatedAt));
     if (!inStage.length) out.push('- _(empty)_', '');
     else {
-      for (const c of inStage) out.push('- ' + cardLine(c, stage, now, laneLabel(c, laneDefs)));
+      for (const c of inStage) out.push('- ' + cardLine(c, stage, now, laneLabel(c, laneDefs), loopMax));
       out.push('');
     }
   }
@@ -121,6 +222,7 @@ export function renderArchive(cards, manifest, { now = Date.now() } = {}) {
   const archived = cards.filter((c) => c.archived);
   if (!archived.length) return null;
   const board = manifest.board ?? {};
+  const loopMax = loopCeiling(manifest);
   const out = [`# ${board.name ?? board.id ?? 'board'} · archive`, ''];
   out.push('> frozen, offloaded cards — read-only, newest first, grouped by disposition. Back to [BOARD.md](BOARD.md).', '');
   const declared = DISPOSITIONS.map((d) => d.disposition);
@@ -130,7 +232,7 @@ export function renderArchive(cards, manifest, { now = Date.now() } = {}) {
     const inDisp = byDisp.get(disp);
     if (!inDisp?.length) continue;
     out.push(`## ${disp} · [${inDisp.length}]`, '');
-    for (const c of [...inDisp].sort((a, b) => ts(b.archived) - ts(a.archived))) out.push('- ' + cardLine(c, null, now));
+    for (const c of [...inDisp].sort((a, b) => ts(b.archived) - ts(a.archived))) out.push('- ' + cardLine(c, null, now, '', loopMax));
     out.push('');
   }
   return out.join('\n').replace(/\n+$/, '\n');
@@ -190,7 +292,7 @@ function statusSections(out, roots, declared, heading) {
 }
 
 function positionLine(p) {
-  const parts = [`\`${p.curie}\``, `"${p.title}"`];
+  const parts = [`\`${p.curie}\``, `"${truncateTitle(p.title)}"`]; // one-line view bounds the title; full text stays in the record
   const flags = [];
   if (p.investment) flags.push(`⇐${p.investment}`); // inbound work — cards advancing this position
   if (p.childCount) flags.push(`+${p.childCount}`); // collapsed nested positions
@@ -246,7 +348,7 @@ export function renderNetwork(host, members, { now = Date.now() } = {}) {
   if (attention.length) out.push('## ⚠ Needs attention', '', ...attention, '');
 
   out.push('## Members', '');
-  if (!members.length) out.push(`- _(no members yet — \`kanbento join @${id}\` from a board)_`, '');
+  if (!members.length) out.push(`- _(no members yet — declare \`networks: ["${id}"]\` in a member board's manifest)_`, '');
   for (const m of members) {
     if (m.error) {
       out.push(`### @${m.handle}`, `  ⚠ unreachable — ${m.error}  (${m.location})`, '');
@@ -284,7 +386,7 @@ function nextLine(manifest, cards) {
   if (n.kind === 'rest') return `idle — ${n.count} in the pool (resting)`;
   if (n.kind === 'hold') return `hold — ${n.reason}`;
   if (n.kind === 'clear') return 'clear';
-  return `${n.verb} ${short(n.card.id)} "${n.card.title}"`;
+  return `${n.verb} ${short(n.card.id)} "${truncateTitle(summary(n.card))}"`; // one-line view bounds the title; full text stays in `card <ref>`
 }
 
 // Per-stage counts on one line, in flow order.
@@ -304,7 +406,7 @@ export async function materializeNetwork(host, members, path, opts) {
 // --- display zones -----------------------------------------------------------
 
 // A full stage section (header + cards). Used in BOARD.md's middle and in POOL.md.
-function stageSection(stage, byStage, now, laneDefs = []) {
+function stageSection(stage, byStage, now, laneDefs = [], loopMax = null) {
   const inStage = byStage.get(stage.id) ?? [];
   const count = stage.wip != null ? `${inStage.length}/${stage.wip}` : `${inStage.length}`;
   const glyph = GLYPH[stage.role] ?? '·';
@@ -317,10 +419,10 @@ function stageSection(stage, byStage, now, laneDefs = []) {
   if (groups) {
     for (const g of groups.order) {
       lines.push(`- **${g.label}** · ${groups.def.axis} · [${g.cards.length}]`); // the swimlane header carries the value
-      for (const c of sortForStage(g.cards, stage)) lines.push('  - ' + cardLine(c, stage, now));
+      for (const c of sortForStage(g.cards, stage)) lines.push('  - ' + cardLine(c, stage, now, '', loopMax));
     }
   } else {
-    for (const c of sortForStage(inStage, stage)) lines.push('- ' + cardLine(c, stage, now, laneLabel(c, laneDefs)));
+    for (const c of sortForStage(inStage, stage)) lines.push('- ' + cardLine(c, stage, now, laneLabel(c, laneDefs), loopMax));
   }
   lines.push('');
   return lines;
@@ -334,13 +436,13 @@ function collapsedOptions(preCommit, byStage) {
 }
 
 // Done, truncated to the most recent DONE_LIMIT; the rest live in DONE.md.
-function truncatedDone(stage, byStage, now, laneDefs = []) {
+function truncatedDone(stage, byStage, now, laneDefs = [], loopMax = null) {
   const inStage = byStage.get(stage.id) ?? [];
   const glyph = GLYPH[stage.role] ?? '·';
   const lines = [`### ${glyph} ${stage.id} · ${stage.role} · [${inStage.length}]`];
   if (!inStage.length) return lines.concat('- _(empty)_', '');
   const recent = [...inStage].sort((a, b) => ts(b.updatedAt) - ts(a.updatedAt)); // newest first
-  for (const c of recent.slice(0, DONE_LIMIT)) lines.push('- ' + cardLine(c, stage, now, laneLabel(c, laneDefs)));
+  for (const c of recent.slice(0, DONE_LIMIT)) lines.push('- ' + cardLine(c, stage, now, laneLabel(c, laneDefs), loopMax));
   if (recent.length > DONE_LIMIT) lines.push(`- … ${recent.length - DONE_LIMIT} more → [DONE.md](DONE.md)`);
   lines.push('');
   return lines;
@@ -391,16 +493,47 @@ function sortForStage(inStage) {
   return inStage.slice().sort((a, b) => ts(a.updatedAt) - ts(b.updatedAt));
 }
 
-function cardLine(c, stage, now, laneTag = '') {
+// A card title is a one-line handle, but nothing bounds how long a captured title
+// runs — a verbose one blows out the fixed-width card line in BOARD/POOL/DONE and
+// shoves the age/glyph/refs tail off the readable edge. Truncate the TITLE SEGMENT
+// ONLY (the caller keeps the surrounding quotes, age, and flags intact); the full
+// text stays untruncated in `card <ref>`. Grapheme-aware — we count and cut on
+// grapheme clusters (via Intl.Segmenter, with a codepoint fallback) so a multi-byte
+// char, emoji, or combining sequence is never split mid-character. A short title
+// passes through byte-for-byte; at exactly the limit it is left whole (the ellipsis
+// only appears when we actually drop content).
+const TITLE_MAX = 160; // graphemes; the bounded one-line width
+const ELLIPSIS = '…';
+function graphemes(s) {
+  if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+    const seg = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    return [...seg.segment(s)].map((g) => g.segment);
+  }
+  return [...s]; // codepoint fallback (surrogate-pair-safe; combining marks may over-count)
+}
+export function truncateTitle(title, max = TITLE_MAX) {
+  const s = String(title ?? '');
+  const g = graphemes(s);
+  if (g.length <= max) return s; // short (or at-limit) — unchanged
+  return g.slice(0, max - 1).join('') + ELLIPSIS; // keep width bounded: (max-1) + the ellipsis
+}
+
+export function cardLine(c, stage, now, laneTag = '', loopMax = null) {
   const parts = [`\`${handle(c)}\``];
   if (c.type) parts.push(c.type); // untyped (e.g. a bare cross-board submission) shows no chip — never the capitalized class name
-  parts.push(`"${c.title}"`);
+  parts.push(`"${truncateTitle(summary(c))}"`); // the one-line view bounds the title; the full text stays in `card <ref>`
   parts.push(age(now - ts(c.updatedAt)));
   const flags = [];
   if (c.lineage?.parent) flags.push(`↳${short(c.lineage.parent)}`);
-  if (c.iterationCount) flags.push(`↺${c.iterationCount}`);
+  // ↺N/max when the board declares a loop ceiling; ↺N alone when max is unknown
+  if (c.iterationCount) flags.push(loopMax != null ? `↺${c.iterationCount}/${loopMax}` : `↺${c.iterationCount}`);
   if (c.binding) flags.push('🔗');
   if (c.blocked) flags.push('⛔');
+  if (c.scope) flags.push(`@${c.scope}`); // product scope — at most one; no chip = the unscoped queue
+  const ac = acBadge(c.checklists); // ☑done/total — the Acceptance Criteria gate progress (☑n/n = delivery-ready)
+  if (ac) flags.push(ac);
+  const rework = reworkBadge(c.checklists); // ⟳open — unresolved Rework items right now (⟳ = current, ↺ = history)
+  if (rework) flags.push(rework);
   const refChip = renderRefChip(c.payload?.refs); // all forward edges (raw CURIE; no resolution at render)
   if (refChip) flags.push(refChip);
   if (laneTag) flags.push(laneTag); // the lane value, inline — for flat sections with no swimlane header
@@ -439,7 +572,7 @@ function renderRefChip(refs) {
 function laneGroups(inStage, laneDefs) {
   if (!laneDefs.length) return null;
   const def = laneDefs[0]; // the primary axis drives the swimlanes
-  const SHARED = ' shared';
+  const SHARED = '\0shared';
   if (!inStage.some((c) => laneValue(c, def) != null)) return null; // all shared -> flat
   const buckets = new Map();
   for (const v of def.values ?? []) buckets.set(v, []); // declared values show even when empty (a demand signal)

@@ -1,5 +1,6 @@
-import { stages as manifestStages, wipEnforcement } from './manifest.js';
+import { stages as manifestStages, lanes as manifestLanes, wipEnforcement } from './manifest.js';
 import { expandedRelations } from './refs.js';
+import { summary } from './kernel.js';
 import { ROLE_SET } from './protocol.js';
 
 // Compile a manifest into a normalized "board program" — the canonical, fully
@@ -40,7 +41,9 @@ export function compile(manifest) {
     stages,
     flows,
     types,
-    lanes: (manifest.lanes ?? []).map((l) => l.axis).filter(Boolean),
+    // Normalizing through lanes() also enforces the reserved-axis guard (an axis
+    // literally named "scope" is rejected with a teaching error at compile).
+    lanes: manifestLanes(manifest).map((l) => l.axis),
     classes: (manifest.classesOfService ?? []).map((c) => c.id).filter(Boolean),
     // declared relations are structural (they change what lint checks and strict
     // rejects) — flat and vocabulary-expanded dotted ids alike enter the baseline
@@ -121,9 +124,9 @@ export function reconcileMoves(changeset, cards, newProgram) {
   const moves = [];
   for (const c of cards) {
     if (renamed.has(c.state)) {
-      moves.push({ card: c.id, title: c.title, from: c.state, to: renamed.get(c.state), reason: 'rename' });
+      moves.push({ card: c.id, title: summary(c), from: c.state, to: renamed.get(c.state), reason: 'rename' });
     } else if (removed.has(c.state)) {
-      moves.push({ card: c.id, title: c.title, from: c.state, to: firstStage, reason: 'removed → first stage' });
+      moves.push({ card: c.id, title: summary(c), from: c.state, to: firstStage, reason: 'removed → first stage' });
     }
   }
   return moves;

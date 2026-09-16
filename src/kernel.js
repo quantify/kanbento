@@ -7,6 +7,7 @@ import {
   loadManifest,
   inboxLanding,
   allowedSources,
+  admittedSourcesNote,
   stageById,
   nextStageId,
   flowEdge,
@@ -21,7 +22,8 @@ import {
 } from './manifest.js';
 import { dispositionForRole } from './protocol.js';
 import { checkRelationStrict, refEdges, parseCurie, resolveRelKey, expandedRelations } from './refs.js';
-import { matchingHooks, runEvaluator, agreementHooks, execCommand, stageContract } from './hooks.js';
+import { attemptFor, foldEnactments, moveDef as protocolMoveDef, isOpener as protocolMoveIsOpener } from './collaborate.js';
+import { matchingHooks, runEvaluator, execCommand, stageContract, gateChecklistItems, isForward as isForwardMove } from './hooks.js';
 import { compile, diffCompiled, isEmptyChangeset, reconcileMoves } from './compile.js';
 
 // Board context derivation lives in boards.js (with resolution + the registry it reads);
@@ -64,13 +66,27 @@ function lastProcedureInvokedDirty(events, curie) {
 // a newer kanbento, or a corrupt line — and must not vanish silently on replay.
 const KNOWN_EVENTS = new Set([
   'ItemCaptured', 'CardTransitioned', 'CardBound', 'CardLinked', 'CardUnlinked', 'CardSlugged', 'CardRetitled', 'CardArchived', 'CardsMerged',
-  'StructureMutated', 'HookEvaluated', 'RunStarted', 'RunEnded', 'MemberJoined', 'MemberLeft', 'ProcedureInvoked',
+  'CardScoped',
+  'ChecklistItemAdded', 'ChecklistItemChecked', 'ChecklistItemUnchecked', 'ChecklistItemRetracted',
+  'StructureMutated', 'HookEvaluated', 'RunStarted', 'RunEnded', 'MemberJoined', 'MemberLeft', 'ProcedureInvoked', 'WatchSet', 'WatchCleared',
+  'MoveActed', 'RecordGraduated', 'Elaborated',
 ]);
 const warnedUnknown = new Set(); // once per type per process — rebuild runs on every verb
 function warnUnknownEvent(type) {
   if (warnedUnknown.has(type)) return;
   warnedUnknown.add(type);
   console.error(`⚠ unknown event type "${type}" in the log — skipped on replay (written by a newer kanbento, or corrupt?)`);
+}
+
+// Re-label an error thrown by an inner verb so a sugar/delegating verb names itself
+// in the message (commit → transition; archive → transition). Prefix match only —
+// messages without the inner verb's prefix pass through unchanged (e.g. `blocked:`).
+function rethrowAsVerb(err, fromVerb, toVerb) {
+  const prefix = `${fromVerb}:`;
+  if (err instanceof Error && err.message.startsWith(prefix)) {
+    throw new Error(`${toVerb}:${err.message.slice(prefix.length)}`);
+  }
+  throw err;
 }
 
 // The kernel: interprets a board manifest and executes verbs against a log.
@@ -164,9 +180,12 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
   // --- reactive subsystem ----------------------------------------------------
 
   async function dispatch(event, phase) {
-    const synth = agreementHooks(manifest, event, phase, boardDir); // auto-fired DoR (entry) + DoD (exit) gates
-    const hooks = [...synth, ...matchingHooks(manifest, event, phase)];
-    if (!hooks.length) return;
+    // Only DECLARED manifest hooks fire here. Gate evaluation is no longer an independent
+    // evaluator on transition — a forward move injects the DoR/DoD gate checklist (seedStageGate)
+    // and the coordinator-dispatched specialist self-evaluates it. No separate gate-eval session
+    // (the double-gating is gone).
+    const hooks = matchingHooks(manifest, event, phase);
+    if (!hooks.length) return [];
     const events = await log.read();
     const cards = rebuild(events);
     for (const hook of hooks) {
@@ -178,6 +197,11 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
       // Appended even when a `before` hook vetoes, so rejected attempts are on record.
       const stamp = { type: 'HookEvaluated', eventId: randomUUID(), at: now(), hook: hookId, phase, on: event.type, cardId: event.cardId ?? null, by: 'hook', cause: { event: event.eventId } };
       if (phase === 'before') {
+        // A declared before-hook (manifest `hooks:` with phase:'before') is a hard gate: a
+        // disapproval vetoes the verb. (Gate evaluation on a transition is NOT here — a forward
+        // move injects the DoR/DoD checklist that the specialist self-evaluates; no separate
+        // evaluator fires. The old agreement-hook enforcement dial + soft-warn downgrade went
+        // with that deletion.)
         const verdict = parseVerdict(res.stdout, res.ok);
         bus.emit('hook', { hook: hookId, phase, verdict });
         await log.append({ ...stamp, approve: verdict.approve, reason: verdict.reason });
@@ -189,6 +213,7 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
         await log.append({ ...stamp, output: res.stdout.slice(0, 280) });
       }
     }
+    return [];
   }
 
   // --- capture ---------------------------------------------------------------
@@ -215,7 +240,7 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
     const sources = allowedSources(manifest);
     if (sources && !sources.includes(sourceKind(source))) {
       throw new Error(
-        `capture: source kind "${sourceKind(source)}" not allowed by inbox.sources [${sources}] — add it to the destination inbox.sources to accept this intake`,
+        `capture: source kind "${sourceKind(source)}" not allowed — ${admittedSourcesNote(manifest)}; add it to the destination inbox.sources to accept this intake`,
       );
     }
     if (type != null) {
@@ -226,6 +251,23 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
       const types = cardTypes(manifest);
       if (types && !types.includes(type)) {
         throw new Error(`capture: type "${type}" not in board types [${types.join(', ')}]`);
+      }
+      // externalKey — an OVERLAY CONSTRAINT, not a different identity. kanbento_id
+      // is and stays THE primary key of every card (engine-owned, always minted);
+      // a type declaring externalKey says its instances must ALSO carry a unique
+      // natural key — the listed card fields — which the capture fold enforces
+      // (best-effort, local log) and resolves to the kanbento_id (the sync/dedup
+      // seam). v1 supports exactly the intake compound ["source","key"]; the array
+      // form (a composite key is a list of field pointers) keeps the grammar stable
+      // for later pointers to other card fields (e.g. lane fields), no migration.
+      if (def?.externalKey != null) {
+        const ek = def.externalKey;
+        if (!Array.isArray(ek) || ek.length !== 2 || ek[0] !== 'source' || ek[1] !== 'key') {
+          throw new Error(`capture: type "${type}" — externalKey: only ["source","key"] is supported (field pointers beyond the intake compound land later)`);
+        }
+        if (!idempotencyKey) {
+          throw new Error(`capture: type "${type}" declares externalKey ["source","key"] — instances must carry the natural key; pass --key (scoped by --source)`);
+        }
       }
     }
     // Lane values: a closed `values` set turns enumeration into a validating
@@ -254,10 +296,22 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
       if (!parent) throw new Error(`capture: --from card "${from}" not found`);
     }
     if (idempotencyKey) {
+      // The natural-key fold — enforces the externalKey overlay constraint (only
+      // reached when a key was passed; an externalKey type requires one above).
+      // A capture without a key has nothing to enforce — kanbento_id, the primary
+      // key, is unique by construction. source+key is the compound: a key is scoped
+      // by its source, so the same key from two sources is two distinct captures.
+      // Re-capture with the same source+key resolves to the existing card's
+      // kanbento_id (idempotent no-op) — re-ingesting the same external item never
+      // duplicates it.
+      // Uniqueness is BEST-EFFORT: a fold over the local log at capture time. Known
+      // limits (deferred until evidence): concurrent captures can race (no global
+      // index/lock), and a cross-board or merged log can carry the same source+key
+      // twice — the fold sees only what is already appended here.
       const existing = (await log.read()).find(
-        (e) => e.type === 'ItemCaptured' && e.idempotencyKey === idempotencyKey,
+        (e) => e.type === 'ItemCaptured' && e.idempotencyKey === idempotencyKey && e.by === source,
       );
-      if (existing) return projectCaptured(existing, { derive: deriveSlug }); // idempotent: same key -> same card
+      if (existing) return projectCaptured(existing, { derive: deriveSlug }); // idempotent: same source+key -> same card
     }
 
     const cardId = id ?? randomUUID(); // caller may supply the id (CLI names the artifact by it first)
@@ -332,7 +386,7 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
     const warnings = [];
 
     // WIP guard on the target stage.
-    const inTarget = [...cards.values()].filter((c) => c.state === toStageId).length;
+    const inTarget = [...cards.values()].filter((c) => c.state === toStageId && !c.archived).length;
     const capacityAvailable = toStage.wip == null || inTarget < toStage.wip;
     if (!capacityAvailable) {
       const msg = `${toStageId} at WIP limit ${toStage.wip}`;
@@ -340,14 +394,16 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
       warnings.push(`WIP (advisory): ${msg}`);
     }
 
-    // The DoR/DoD (a stage's entry/exit criteria) are judged independently as
-    // before-hooks (see agreementHooks) — not a self-asserted gate here.
+    // The DoR/DoD (a stage's entry/exit criteria) are not judged by a separate evaluator
+    // here: a forward move injects the gate checklist (seedStageGate, below) and the
+    // coordinator-dispatched specialist self-evaluates it. No claude -p gate fires on the move.
 
     // Loop iteration signal (a feedback edge with a convergence budget).
-    let loop = false;
+    // Surface taken/max on the return so the CLI can print remaining headroom.
+    let loop = null;
     if (edge?.kind === 'loop') {
-      loop = true;
       const taken = (card.iterationCount ?? 0) + 1;
+      loop = { taken, maxIterations: edge.maxIterations ?? null };
       if (edge.maxIterations && taken >= edge.maxIterations) {
         warnings.push(`loop ${from}->${toStageId} reached maxIterations ${edge.maxIterations} — consider escalating`);
       }
@@ -368,22 +424,53 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
       ...worktree,
     };
 
-    await dispatch(event, 'before'); // an evaluator may veto (prose policy enforced by LLM)
+    const gateWarnings = await dispatch(event, 'before'); // a declared before-hook may still veto
+    if (gateWarnings?.length) warnings.push(...gateWarnings);
     await log.append(event);
-    const updated = rebuild([...events, event]).get(card.id);
+    // Seed the landed stage's gate checklist AFTER the transition lands (a declared-hook veto
+    // never reaches here). Forward-only; loop-back / return re-entries do not seed.
+    // checklistWrite text-dedup keeps re-entry idempotent.
+    if (isForwardMove(manifest, from, toStageId)) {
+      await seedStageGate(card.id, toStageId, { by });
+    }
+    const updated = rebuild(await log.read()).get(card.id);
     bus.emit('transitioned', { card: updated, warnings });
     await dispatch(event, 'after');
-    return { card: updated, warnings };
+    return { card: updated, warnings, loop };
+  }
+
+  // Inject `"${stageId} gate"` from the stage's entry (DoR) + exit (DoD) criteria.
+  // No-op when the stage has no criteria, or every item is already present (re-entry).
+  // Preserves any already-ticked done state on re-seed so self-assessment ticks survive.
+  async function seedStageGate(cardId, stageId, { by = 'agent' } = {}) {
+    const gate = gateChecklistItems(manifest, stageId, boardDir);
+    if (!gate) return;
+    const card = rebuild(await log.read()).get(cardId);
+    if (!card) return;
+    const stored = card.checklists?.[gate.listName] ?? [];
+    const have = new Set(stored.map((it) => it.text));
+    const newcomers = gate.items.filter((it) => !have.has(it.text));
+    if (!newcomers.length) return; // idempotent: nothing new to append
+    // checklistWrite is whole-list + append-only: restate stored (keep done), then append.
+    const desired = [...stored.map((it) => ({ text: it.text, done: !!it.done })), ...newcomers];
+    await checklistWrite(cardId, gate.listName, desired, { by });
   }
 
   // --- commit ----------------------------------------------------------------
 
+  // Sugar over transition into the commit-role stage. Transition owns the error
+  // strings (`transition: …`); re-label so the verb the user typed is named
+  // (story:commit-error-verb — `commit missing-ref` must not say `transition:`).
   async function commit(cardRef, opts = {}) {
     const target = commitStageId(manifest);
     if (!target) {
       throw new Error('commit: this board has no `commit` stage (no commitment point yet)');
     }
-    return transition(cardRef, target, opts);
+    try {
+      return await transition(cardRef, target, opts);
+    } catch (err) {
+      rethrowAsVerb(err, 'transition', 'commit');
+    }
   }
 
   // --- bind (attach a materialized doc to a card) ----------------------------
@@ -485,24 +572,149 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
     return { card: rebuild([...events, event]).get(from.id), from, rel, target: hit, removed: true };
   }
 
-  // --- reslug (refine a card's slug via the model) ---------------------------
+  // --- checklists (boolean status carrier + optional discard) ----------------
+  // Each item: boolean open↔done, optional retracted=discarded from the contract.
+  // --retract is discard (not a third boolean, not hard-delete). See checklist.js.
+
+  // Whole-text write. `desired` is the parsed list [{text, done}] the CLI produced
+  // from the `- [ ]` / `- [x]` grammar; this DERIVES the events by diffing it against
+  // the stored list (matched by text identity). The core invariant is append-only:
+  // a *active* (non-discarded) item that IS stored but is MISSING from the submission
+  // is a delete/text-edit — rejected. Discarded items may be omitted (writers need not
+  // restate dead criteria) or restated (accepted, still discarded). Order is
+  // canonicalized: stored items keep their stored index; a new item (a text not yet
+  // stored) appends after them, in submission order.
+  //
+  // Boolean done-state on existing items: whole-text may promote open→done (`[x]`),
+  // but MUST NOT derive Unchecked from a restated `[ ]` — restating must not wipe
+  // ticks. Explicit `checklistToggle(..., false)` / `--uncheck` is the uncheck path.
+  // Newcomers still take their mark from the write.
+  async function checklistWrite(cardRef, list, desired, { by = 'agent' } = {}) {
+    list = String(list ?? '').trim();
+    if (!list) throw new Error('checklist: a list name is required');
+    const seen = new Set();
+    for (const d of desired) {
+      if (seen.has(d.text)) throw new Error(`checklist: duplicate item "${d.text}" — items are identified by text, so they must be unique within a list`);
+      seen.add(d.text);
+    }
+    const events = await log.read();
+    const card = resolveCard(rebuild(events), cardRef);
+    if (!card) throw new Error(`checklist: card "${cardRef}" not found`);
+    assertLive(card, 'checklist');
+    const stored = card.checklists?.[list] ?? [];
+    // no-delete guard: every active (non-retracted) stored text MUST survive into the
+    // submission. Retracted items are optional in the restatement.
+    for (const it of stored) {
+      if (it.retracted) continue;
+      if (!seen.has(it.text)) {
+        throw new Error(`checklist: "${it.text}" is stored but missing from the write — whole-text is the full desired list (restate every active item, then add newcomers); append-only: never hard-delete or rename (use --retract to discard a criterion from the contract)`);
+      }
+    }
+    const storedByText = new Map(stored.map((it, i) => [it.text, { done: it.done, index: i, retracted: !!it.retracted }]));
+    const derived = [];
+    // Existing items: promote [ ]→[x] only; never wipe a stored tick via whole-text.
+    for (const d of desired) {
+      const ex = storedByText.get(d.text);
+      if (!ex) continue;
+      if (d.done && !ex.done) derived.push({ type: 'ChecklistItemChecked', list, index: ex.index });
+      // no ChecklistItemUnchecked from whole-text — preserve done-state on restate
+    }
+    // New items: append after the stored tail, keeping submission order.
+    let nextIndex = stored.length;
+    for (const d of desired) {
+      if (storedByText.has(d.text)) continue;
+      derived.push({ type: 'ChecklistItemAdded', list, index: nextIndex, text: d.text });
+      if (d.done) derived.push({ type: 'ChecklistItemChecked', list, index: nextIndex });
+      nextIndex++;
+    }
+    const out = [];
+    for (const d of derived) {
+      const event = { ...d, eventId: randomUUID(), cardId: card.id, at: now(), by, ...causeFromEnv() };
+      await log.append(event);
+      events.push(event);
+      out.push(event);
+    }
+    bus.emit('checklist', { card: card.id, list, derived: out.length });
+    return { card: rebuild(events).get(card.id), list, events: out };
+  }
+
+  // Single-item toggle by stable (0-based) index — merge-safe (two actors toggling
+  // different indices compose cleanly). Idempotent: toggling to the state it already
+  // holds is an honest no-op (changed:false), not a throw. Retracted items still
+  // accept toggle (done flag is independent history; open counts ignore retracted).
+  async function checklistToggle(cardRef, list, index, done, { by = 'agent' } = {}) {
+    list = String(list ?? '').trim();
+    const events = await log.read();
+    const card = resolveCard(rebuild(events), cardRef);
+    if (!card) throw new Error(`checklist: card "${cardRef}" not found`);
+    assertLive(card, 'checklist');
+    const items = card.checklists?.[list];
+    if (!items || !items.length) throw new Error(`checklist: card has no "${list}" list`);
+    if (!Number.isInteger(index) || index < 0 || index >= items.length) {
+      throw new Error(`checklist: "${list}" has no item at position ${index + 1} (1..${items.length})`);
+    }
+    if (items[index].done === done) return { card, list, index, changed: false };
+    const event = { type: done ? 'ChecklistItemChecked' : 'ChecklistItemUnchecked', eventId: randomUUID(), cardId: card.id, at: now(), by, list, index, ...causeFromEnv() };
+    await log.append(event);
+    bus.emit('checklist', { card: card.id, list, index });
+    return { card: rebuild([...events, event]).get(card.id), list, index, changed: true };
+  }
+
+  // Discard an item by stable (0-based) index — append-only. The discard form of the
+  // boolean status carrier: a criterion that left the contract (wrong, not merely
+  // unmet) is retracted so it no longer blocks --incomplete, while the row stays
+  // visible (stable indices, history as [~]). Not uncheck, not hard-delete. Idempotent.
+  async function checklistRetract(cardRef, list, index, { by = 'agent' } = {}) {
+    list = String(list ?? '').trim();
+    const events = await log.read();
+    const card = resolveCard(rebuild(events), cardRef);
+    if (!card) throw new Error(`checklist: card "${cardRef}" not found`);
+    assertLive(card, 'checklist');
+    const items = card.checklists?.[list];
+    if (!items || !items.length) throw new Error(`checklist: card has no "${list}" list`);
+    if (!Number.isInteger(index) || index < 0 || index >= items.length) {
+      throw new Error(`checklist: "${list}" has no item at position ${index + 1} (1..${items.length})`);
+    }
+    if (items[index].retracted) return { card, list, index, changed: false };
+    const event = { type: 'ChecklistItemRetracted', eventId: randomUUID(), cardId: card.id, at: now(), by, list, index, ...causeFromEnv() };
+    await log.append(event);
+    bus.emit('checklist', { card: card.id, list, index, retracted: true });
+    return { card: rebuild([...events, event]).get(card.id), list, index, changed: true };
+  }
+
+  // --- reslug (refine a card's slug — model-derived OR explicit pin) ---------
 
   // Record a refined slug (and, if a bound doc was renamed to match, its new path).
   // Append-only — a CardSlugged event the fold applies. The slug is advisory (the id
   // is the key), so this can safely land AFTER capture returned: the handle just
   // sharpens, nothing resolves wrong in the gap. The model call and any file rename
-  // are the CLI's; this records — and slugifies, so a chatty model can never write a
-  // bad handle. No-op when the slug is unchanged/empty.
-  async function reslug(cardRef, newSlug, { path, by = 'agent' } = {}) {
+  // are the CLI's; this records. Two shapes:
+  //   - default (model-derived / auto-sharpener): slugify capped at 48 so a chatty
+  //     model can never write a bad handle.
+  //   - pinned:true (explicit elaborate --slug): the operator's word — explicitSlug
+  //     (sanitize, never cap). Sacred: overrides a prior pin; collision is the
+  //     caller's job (applyReslug fails loud).
+  // No-op when the slug is unchanged/empty.
+  async function reslug(cardRef, newSlug, { path, by = 'agent', pinned = false } = {}) {
     const events = await log.read();
     const card = resolveCard(rebuild(events), cardRef);
     if (!card) throw new Error(`reslug: card "${cardRef}" not found`);
     if (card.archived) return card; // frozen — the handle is settled; advisory reslug is a no-op
     assertSafeSlug(newSlug); // defense in depth: a reslug renames a path, so reject an unvetted programmatic slug
-    newSlug = slugify(String(newSlug ?? ''), 48); // a model-derived slug stays capped; slugify also neutralizes charset
+    // pinned = operator's --slug (verbatim after sanitize); else model-derived (capped).
+    newSlug = pinned
+      ? explicitSlug(assertSafeSlug(newSlug))
+      : slugify(String(newSlug ?? ''), 48);
 
     if (!newSlug || newSlug === 'untitled' || newSlug === card.slug) return card;
-    const event = { type: 'CardSlugged', eventId: randomUUID(), cardId: card.id, at: now(), by, slug: newSlug, ...(path ? { path } : {}), ...causeFromEnv() };
+    // pinned:true marks an operator --slug so a later retitle auto-sharpener
+    // leaves it alone (same sacred rule as ItemCaptured.slug at birth).
+    const event = {
+      type: 'CardSlugged', eventId: randomUUID(), cardId: card.id, at: now(), by, slug: newSlug,
+      ...(path ? { path } : {}),
+      ...(pinned ? { pinned: true } : {}),
+      ...causeFromEnv(),
+    };
     await log.append(event);
     bus.emit('slugged', { card: card.id, slug: newSlug });
     return rebuild([...events, event]).get(card.id);
@@ -512,15 +724,48 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
   // but the board renders the old framing). Append-only — a CardRetitled event the
   // fold applies, latest wins. Substantive, unlike the advisory reslug: a frozen
   // (archived) card refuses. No-op when unchanged/empty.
-  async function retitle(cardRef, title, { by = 'agent' } = {}) {
+  // pinned:true marks an operator --title (elaborate --title) so a later naming
+  // pass leaves it alone — same sacred rule as CardSlugged.pinned / ItemCaptured.title.
+  // A model-derived CardRetitled has no .pinned and may be re-sharpened.
+  async function retitle(cardRef, title, { by = 'agent', pinned = false } = {}) {
     const events = await log.read();
     const card = resolveCard(rebuild(events), cardRef);
     if (!card) throw new Error(`retitle: card "${cardRef}" not found`);
     if (card.archived) throw new Error(`retitle: card "${card.slug ?? card.id.slice(0, 8)}" is archived (read-only)`);
     title = String(title ?? '').trim();
     if (!title || title === card.title) return card;
-    const event = { type: 'CardRetitled', eventId: randomUUID(), cardId: card.id, at: now(), by, title, ...causeFromEnv() };
+    const event = {
+      type: 'CardRetitled', eventId: randomUUID(), cardId: card.id, at: now(), by, title,
+      ...(pinned ? { pinned: true } : {}),
+      ...causeFromEnv(),
+    };
     await log.append(event);
+    return rebuild([...events, event]).get(card.id);
+  }
+
+  // Assign / reassign / heal a card's product scope. Append-only — a CardScoped
+  // event the fold applies: `scope` + `payload.scope` (the log-owned field) and,
+  // when the bound doc moved, `binding.path`. The CLI owns the filesystem (validate
+  // the vocabulary, mkdir + rename); this records. `scope: null` is a heal of the
+  // unscoped queue (placement only — un-scoping is not an assignable value).
+  // No-op when the field and the optional path are already current.
+  async function scope(cardRef, newScope, { path, by = 'agent' } = {}) {
+    const events = await log.read();
+    const card = resolveCard(rebuild(events), cardRef);
+    if (!card) throw new Error(`scope: card "${cardRef}" not found`);
+    assertLive(card, 'scope');
+    const next = newScope == null || newScope === '' ? null : String(newScope);
+    const sameScope = (card.scope ?? null) === next;
+    const samePath = !path || card.binding?.path === path;
+    if (sameScope && samePath) return card;
+    const event = {
+      type: 'CardScoped', eventId: randomUUID(), cardId: card.id, at: now(), by,
+      scope: next, from: card.scope ?? null,
+      ...(path ? { path } : {}),
+      ...causeFromEnv(),
+    };
+    await log.append(event);
+    bus.emit('scoped', { card: card.id, scope: next, path });
     return rebuild([...events, event]).get(card.id);
   }
 
@@ -545,7 +790,14 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
     if (!disposition) throw new Error(`archive: stage "${stage.id}" (role ${stage.role ?? 'none'}) has no disposition to freeze`);
 
     // Reach the terminal the same way as any move — the gate fires and may prevent it.
-    if (card.state !== stage.id) ({ card } = await transition(cardRef, stage.id, { by }));
+    // Re-label transition failures so archive callers see `archive:`, not the inner verb.
+    if (card.state !== stage.id) {
+      try {
+        ({ card } = await transition(cardRef, stage.id, { by }));
+      } catch (err) {
+        rethrowAsVerb(err, 'transition', 'archive');
+      }
+    }
 
     const event = { type: 'CardArchived', eventId: randomUUID(), cardId: card.id, at: now(), by, stage: stage.id, disposition, ...causeFromEnv() };
     await dispatch(event, 'before'); // a declared policy hook may still veto (e.g. who may discard)
@@ -897,6 +1149,199 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
     return event;
   }
 
+  // --- graduate (log a record's status transition — audit-only) --------------
+
+  // Witness a record's status graduation (e.g. procedure draft→trusted): a
+  // `RecordGraduated` event on the log, identity-stamped (`by` + the `principal`
+  // the log wrapper adds), carrying the record curie, its type, the status field,
+  // and from→to. Records are fs-owned (not in the card fold), so the frontmatter
+  // write is the store and this event is AUDIT-ONLY — the card fold ignores it,
+  // like ProcedureInvoked/HookEvaluated. Its whole point is provenance: "who armed
+  // this gate and when" answerable from the log alone, not just git blame. The
+  // caller (commandsjs graduateRecord) does the resolve, vocabulary validation, and
+  // the frontmatter write; this method only appends the witness.
+  async function graduate(record, from, to, { by = 'agent', field = 'status' } = {}) {
+    const curie = String(record ?? '').trim();
+    if (!curie) throw new Error('graduate: a record curie is required');
+    to = String(to ?? '').trim();
+    if (!to) throw new Error('graduate: a target status is required');
+    const event = {
+      type: 'RecordGraduated',
+      eventId: randomUUID(),
+      record: curie,
+      field,
+      from: from ?? null,
+      to,
+      at: now(),
+      by,
+      ...causeFromEnv(),
+    };
+    await log.append(event);
+    bus.emit('graduated', { record: curie, from: from ?? null, to });
+    return event;
+  }
+
+  // --- elaborated (witness a body write — audit-only) ------------------------
+
+  // Witness a `kanbento elaborate` body write: an `Elaborated` event on the log,
+  // identity-stamped (`by` + the `principal` the log wrapper adds), carrying the
+  // target ref/id, the record-vs-card `kind`, the `mode` (append | replace body write,
+  // or `retitle` for a title-only record revision), and a `retitled` flag when a title
+  // change rode a body write (both witness a record retitle without inflating accretion).
+  // Both records (fs-owned) and cards (bound docs) fire it — the log gains the audit
+  // dimension for the board's most common knowledge act. AUDIT-ONLY for the card
+  // fold (ignored on replay, like RecordGraduated); its purpose is the accretion
+  // fold (foldAccretion in accretion.js) — appends-since-last-consolidation, derived
+  // on demand by every consumer (elaborate nudge, lintShape, card --stats, CURATION).
+  // The caller (commandsjs elaborateCard) does the resolve + the body write; this
+  // method only appends the witness.
+  async function elaborated(ref, kind, mode, { by = 'agent', retitled = false } = {}) {
+    const target = String(ref ?? '').trim();
+    if (!target) throw new Error('elaborated: a target ref is required');
+    const event = {
+      type: 'Elaborated',
+      eventId: randomUUID(),
+      ref: target,
+      kind,
+      mode, // append | replace (a body write) | retitle (a title-only record revision)
+      ...(retitled ? { retitled: true } : {}), // a title change rode this body write — witnessed, not accreted
+      at: now(),
+      by,
+      ...causeFromEnv(),
+    };
+    await log.append(event);
+    bus.emit('elaborated', { ref: target, kind, mode });
+    return event;
+  }
+
+  // --- act (play a move in the Collaborate protocol) -------------------------
+
+  // Append a binding event to the card's current enactment (the COLLABORATE protocol —
+  // note:collaborate-protocol-draft). A move lands its declared `out`s onto the
+  // enactment keyed (card, stage, attempt); the log is the binding history. Discipline
+  // (notation-not-runtime): SINGLE-BINDING is HARD-REFUSED as store integrity (a param
+  // binds once, ever — like idempotency); everything else is JUDGMENT — a missing `in`,
+  // an unknown move, an off-role play WARN, never wall. The parsed `protocol` + `strict`
+  // are passed in by the caller (it resolves + parses the agreement doc); a Move-less
+  // `remark` is the untyped overflow hatch (accepted with no checks). Returns
+  // { card, event, warnings, attempt }.
+  async function act(cardRef, moveName, { bindings = {}, remark = null, role = null, protocol = null, protocolName = null, strict = false, by = 'agent' } = {}) {
+    const events = await log.read();
+    const card = resolveCard(rebuild(events), cardRef);
+    if (!card) throw new Error(`act: card "${cardRef}" not found`);
+    assertLive(card, 'act');
+    const stage = card.state;
+    const warnings = [];
+
+    // The untyped remark — the overflow buffer; no binding, no checks (the hatch must
+    // exist so exceptions don't drain back into ephemeral prose and die there).
+    if (!moveName) {
+      const text = String(remark ?? '').trim();
+      if (!text) throw new Error('act: a Move or a --remark is required — act <card> <Move> [key=value...] | act <card> --remark "<text>"');
+      const attempt = attemptFor(events, card.id, null) || 1;
+      const event = { type: 'MoveActed', eventId: randomUUID(), cardId: card.id, at: now(), by, stage, attempt, move: null, remark: text, ...causeFromEnv() };
+      await log.append(event);
+      bus.emit('acted', { card: card.id, remark: text });
+      return { card, event, warnings, attempt };
+    }
+
+    const def = protocol ? protocolMoveDef(protocol, moveName) : null;
+    if (!def) {
+      const msg = `unknown move "${moveName}"${protocol ? ' — not in the declared protocol' : ' — no protocol declared on this board'}`;
+      if (strict) throw new Error(`act: ${msg}`);
+      warnings.push(msg);
+    }
+    role = role ?? def?.role ?? null;
+    if (def && role && role !== def.role) warnings.push(`move "${moveName}" is owned by ${def.role}, acted as ${role}`);
+
+    const attempt = attemptFor(events, card.id, def);
+    const enactments = foldEnactments(events, card.id);
+    const bound = enactments.get(attempt)?.bindings ?? {};
+    const prevBound = attempt > 1 ? (enactments.get(attempt - 1)?.bindings ?? {}) : {};
+
+    // Missing-in WARNINGS — a move fired before its precondition bound is a judgment call
+    // the agent owns (it may know better); surface it, never refuse.
+    for (const p of def?.in ?? []) {
+      const has = def.prevIns.includes(p) ? prevBound[p] !== undefined : bound[p] !== undefined;
+      if (!has) warnings.push(`missing in "${p}"${def.prevIns.includes(p) ? ' (previous attempt)' : ''} — not yet bound on this enactment`);
+    }
+
+    // The bindings this move lands: its declared `out`s (marker value `true`), overlaid
+    // with explicit key=value / body. A provided key outside the move's outs WARNS.
+    const outs = def?.out ?? [];
+    const landing = {};
+    for (const p of outs) landing[p] = true;
+    for (const [k, v] of Object.entries(bindings)) {
+      if (def && !outs.includes(k)) warnings.push(`param "${k}" is not an out of "${moveName}"`);
+      landing[k] = v;
+    }
+    if (!Object.keys(landing).length) throw new Error(`act: move "${moveName}" binds nothing — declare its outs in the protocol, or pass key=value`);
+
+    // HARD REFUSE double-binding — store integrity, the class of rule append-only +
+    // idempotency keys are: a parameter binds once, ever. Ship/Polish/Reject are
+    // exclusive BY THIS: all bind `verdict`, so the second to fire is refused here.
+    for (const p of Object.keys(landing)) {
+      if (bound[p] !== undefined) {
+        throw new Error(`act: "${p}" is already bound on attempt ${attempt} (= ${JSON.stringify(bound[p])}) — single-binding: a parameter binds once, ever. Rework is a fresh attempt, not a rebind.`);
+      }
+    }
+
+    // The opening move records the choice — an opener (no current-attempt in) stamps the
+    // governing protocol name onto its event, so the enactment is self-describing: later
+    // reads (workspace/lint) resolve the agreement per enactment from the log.
+    const stampProtocol = protocolName && protocolMoveIsOpener(def);
+    // A remark composes onto the move — the same MoveActed event carries both fields (a move
+    // with a note is one utterance). Empty/whitespace remarks are dropped; the move stands.
+    const noteText = String(remark ?? '').trim();
+    const event = { type: 'MoveActed', eventId: randomUUID(), cardId: card.id, at: now(), by, stage, attempt, move: moveName, ...(role ? { role } : {}), ...(stampProtocol ? { protocol: protocolName } : {}), bindings: landing, ...(noteText ? { remark: noteText } : {}), ...causeFromEnv() };
+    await log.append(event);
+    bus.emit('acted', { card: card.id, move: moveName, warnings });
+    return { card, event, warnings, attempt };
+  }
+
+  // --- watch (a standing observation on external state) ----------------------
+
+  // Register a watch on a card: a WatchSet event on the log (the REGISTRATION is the event;
+  // per-check state lives off-log in a state file — see watch.js). Idempotent by fold: a
+  // re-registration of the same (card, on) appends a fresh WatchSet and the fold takes the
+  // latest, so the question is updated, not duplicated. The question is the matcher's stored
+  // condition — required (a watch with no question can never be matched).
+  async function watchSet(cardRef, on, question, { by = 'agent' } = {}) {
+    on = String(on ?? '').trim();
+    question = String(question ?? '').trim();
+    if (!on) throw new Error('watch: `on` is required — watch <ref> --on <namespace:id>');
+    if (!question) throw new Error('watch: a question is required — the matcher needs a condition to test (watch <ref> --on <ns:id> "<question>")');
+    const events = await log.read();
+    const card = resolveCard(rebuild(events), cardRef);
+    if (!card) throw new Error(`watch: card "${cardRef}" not found`);
+    assertLive(card, 'watch');
+    const event = { type: 'WatchSet', eventId: randomUUID(), cardId: card.id, at: now(), by, on, question, ...causeFromEnv() };
+    await log.append(event);
+    bus.emit('watchSet', { card: card.id, on });
+    return { card, on, question };
+  }
+
+  // Clear a watch: a WatchCleared event the fold applies (drops the (card, on) entry).
+  // Idempotent — clearing an absent watch is an honest no-op (removed:false), never a throw.
+  async function watchCleared(cardRef, on, { by = 'agent' } = {}) {
+    on = String(on ?? '').trim();
+    const events = await log.read();
+    const card = resolveCard(rebuild(events), cardRef);
+    if (!card) throw new Error(`watch: card "${cardRef}" not found`);
+    const active = foldWatches(events);
+    if (!active.has(watchKey(card.id, on))) return { card, on, removed: false }; // nothing to clear
+    const event = { type: 'WatchCleared', eventId: randomUUID(), cardId: card.id, at: now(), by, on, ...causeFromEnv() };
+    await log.append(event);
+    bus.emit('watchCleared', { card: card.id, on });
+    return { card, on, removed: true };
+  }
+
+  // The active watches — WatchSet/WatchCleared folded to the current set. Each carries the
+  // watching card's id, the referent, the stored question, and when it was set.
+  async function watches() {
+    return [...foldWatches(await log.read()).values()];
+  }
+
   function rebuild(evts) {
     const cards = new Map();
     for (const e of evts) {
@@ -945,6 +1390,51 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
         const c = cards.get(e.cardId);
         if (c) {
           c.title = e.title; // latest wins — same shape as CardSlugged
+          c.updatedAt = e.at;
+        }
+      } else if (e.type === 'CardScoped') {
+        const c = cards.get(e.cardId);
+        if (c) {
+          const next = e.scope ?? null;
+          c.scope = next;
+          const payload = { ...(c.payload ?? {}) };
+          if (next == null) delete payload.scope;
+          else payload.scope = next;
+          c.payload = payload;
+          if (e.path) {
+            c.binding = c.binding
+              ? { ...c.binding, path: e.path }
+              : { path: e.path, identity: c.id };
+          }
+          c.updatedAt = e.at;
+        }
+      } else if (e.type === 'ChecklistItemAdded') {
+        const c = cards.get(e.cardId);
+        if (c) {
+          const lists = { ...(c.checklists ?? {}) };
+          const arr = lists[e.list] ? [...lists[e.list]] : [];
+          arr[e.index] = { text: e.text, done: false }; // append-only: index is the stable position
+          lists[e.list] = arr;
+          c.checklists = lists;
+          c.updatedAt = e.at;
+        }
+      } else if (e.type === 'ChecklistItemChecked' || e.type === 'ChecklistItemUnchecked') {
+        const c = cards.get(e.cardId);
+        const arr = c?.checklists?.[e.list];
+        if (arr && arr[e.index]) {
+          const done = e.type === 'ChecklistItemChecked';
+          const next = [...arr];
+          next[e.index] = { ...next[e.index], done };
+          c.checklists = { ...c.checklists, [e.list]: next };
+          c.updatedAt = e.at;
+        }
+      } else if (e.type === 'ChecklistItemRetracted') {
+        const c = cards.get(e.cardId);
+        const arr = c?.checklists?.[e.list];
+        if (arr && arr[e.index]) {
+          const next = [...arr];
+          next[e.index] = { ...next[e.index], retracted: true };
+          c.checklists = { ...c.checklists, [e.list]: next };
           c.updatedAt = e.at;
         }
       } else if (e.type === 'CardArchived') {
@@ -1007,8 +1497,23 @@ export async function openBoard({ manifest: manifestArg, manifestPath, log, boar
     }
   }
 
-  return { manifest, log, boardDir, on: bus.on.bind(bus), capture, transition, commit, bind, link, unlink, reslug, retitle, archive, run, merge, procedureInvoked, reconcile, sync, joinMember, leaveMember, roster, pool, card, events };
+  return { manifest, log, boardDir, on: bus.on.bind(bus), capture, transition, commit, bind, link, unlink, checklistWrite, checklistToggle, checklistRetract, reslug, retitle, scope, archive, run, merge, act, graduate, elaborated, procedureInvoked, watchSet, watchCleared, watches, reconcile, sync, joinMember, leaveMember, roster, pool, card, events };
 }
+
+// Fold WatchSet/WatchCleared into the active watch set — the same append-only projection as
+// the card/roster folds, keyed by (cardId, on). A later WatchSet on the same key updates the
+// question (re-registration); a WatchCleared drops it. Separate from the card fold: a watch
+// is standing observation ABOUT a card, not card state (a check never appends to the log).
+export function foldWatches(evts) {
+  const active = new Map();
+  for (const e of evts) {
+    if (e.type === 'WatchSet') active.set(watchKey(e.cardId, e.on), { cardId: e.cardId, on: e.on, question: e.question, setAt: e.at });
+    else if (e.type === 'WatchCleared') active.delete(watchKey(e.cardId, e.on));
+  }
+  return active;
+}
+
+function watchKey(cardId, on) { return `${cardId}\0${on}`; }
 
 // Fold the membership events into a roster: handle -> where the member lives.
 // Separate from the card fold (members are not cards) but the same append-only
@@ -1052,7 +1557,7 @@ async function buildContext(manifest, event, hook, cards, events, boardDir) {
     card,
     doc,
     history: card ? events.filter((e) => e.cardId === card.id).map(briefEvent) : [],
-    policy: hook.policy ?? null, // an agreement hook carries its DoR/DoD criteria; a declared hook may carry its own
+    policy: hook.policy ?? null, // a declared hook may carry its own policy; the run-exit judge carries its exit criterion
     state: stageCounts(manifest, cards),
     ask: hook.evaluate ?? hook.prompt ?? 'Evaluate this event and respond.',
     expects:
@@ -1146,22 +1651,45 @@ function causeFromEnv() {
 // A card's title is a one-line handle; derive it from the body's first non-empty
 // line when none was given (a rich submission carries its summary up top, and a
 // leading markdown heading marker is dropped).
-function summarize(body) {
+export function summarize(body) {
   const line = String(body ?? '').split('\n').map((l) => l.trim()).find(Boolean) ?? '';
   return line.replace(/^#+\s*/, '') || 'untitled';
 }
 
+// What to PRINT for a card. Computed, never stored: the authored title when there
+// is one, else the body's first line. Deliberately a function and not a field — a
+// derived value copied onto the object has to be re-synced at every fold site, and
+// a copy that can drift is the defect this doctrine exists to remove.
+export function summary(card) {
+  return card?.title ?? summarize(card?.body);
+}
+
 function projectCaptured(event, { derive = true } = {}) {
-  const title = event.title ?? summarize(event.body); // short handle; the body may be richer
+  // TITLE (note:authored-title-doctrine): authored text or null. It records the
+  // FACT that somebody named this card, so "was it named?" is a field read rather
+  // than an inference. Nothing synthetic is ever stored here — no frontmatter copy,
+  // nothing in the search index. What you PRINT is summary(card), computed.
+  const title = event.title ?? null;
   return {
     id: event.cardId,
     title,
     body: event.body, // the full submission — may be multi-line markdown, beyond the title
-    slug: event.slug ?? (derive ? titleSlug(title) : undefined), // human handle; heuristic unless slugify is off
+    slug: event.slug ?? (derive ? titleSlug(title ?? summarize(event.body)) : undefined), // human handle; heuristic unless slugify is off (a slug needs a string, named or not)
     type: event.cardType ?? null, // set at capture (--type), else classified later
+    // The natural key (body-less): source is the intake scope, key the identity
+    // within it — the compound an externalKey type constrains to be unique and
+    // resolves to `id` (kanbento_id — THE primary key, always). Read straight off
+    // the capture event, never materialized into frontmatter. key is null when
+    // the capture carried no --key.
+    source: event.by ?? null,
+    key: event.idempotencyKey ?? null,
     state: event.landing,
     lane: event.lane ?? {},
     payload: event.payload ?? {},
+    // The product-scope axis (at most one per card; null = the unscoped queue).
+    // Lifted to the top level so every surface prints it without digging into the
+    // payload — a scope that lives only in the JSON is a scope that gets skipped.
+    scope: event.payload?.scope ?? event.lane?.scope ?? null,
     binding: event.binding ?? null,
     lineage: { parent: event.parent ?? null },
     iterationCount: 0,
@@ -1200,5 +1728,6 @@ function resolveCard(cards, ref) {
 }
 
 // removed: the self-asserted entry gate (evalGate/satisfied, --assert). A stage's
-// entry/exit criteria (DoR/DoD) are now judged independently as before-hooks
-// (agreementHooks); WIP capacity is enforced inline in transition (above).
+// entry/exit criteria (DoR/DoD) are surfaced as an injected gate checklist on a forward
+// transition (seedStageGate) that the coordinator-dispatched specialist self-evaluates —
+// no independent evaluator fires. WIP capacity is enforced inline in transition (above).

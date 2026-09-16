@@ -1,4 +1,6 @@
 import { refEdges, refTarget, collectBacklinks } from './refs.js';
+import { lintShape } from './lint.js';
+import { foldAccretion } from './accretion.js';
 
 // A record's resolved graph view, rendered to markdown — the materialized view kanbento
 // OWNS (a side-car), so the source file stays human-definitive and untouched. Backlinks
@@ -13,6 +15,32 @@ function mark(t, known, exists) {
   if (t.type === 'file') return exists && !exists(t.path) ? '⚠ missing' : '✓';
   if (t.embodiment === 'none') return '~ handle';
   return known.has(t.curie) ? '✓' : '⚠ dangling';
+}
+
+// A record's forward-ref graph, curie -> Set(target curie). The adjacency the cycle
+// probe walks. Only records (curies) are nodes; file:/handle targets are leaves.
+function refAdjacency(records) {
+  const adj = new Map();
+  for (const r of records) if (r.curie) adj.set(r.curie, new Set(refEdges(r.refs).map((e) => e.curie)));
+  return adj;
+}
+
+// Does a forward path exist from `from` back to `to` (including from === to)? A visited
+// set makes the walk cycle-SAFE — a legitimately cyclic knowledge graph (A depends-on B,
+// B depends-on A; or a self-reference) is answered, never recursed into forever. Used to
+// flag a forward edge that closes a cycle back through this record, so the view SHOWS the
+// cycle rather than silently rendering a back-edge that reads as one-way.
+function reaches(adj, from, to) {
+  const seen = new Set();
+  const stack = [from];
+  while (stack.length) {
+    const n = stack.pop();
+    if (n === to) return true; // a length-0 path (self-ref) or a closed loop
+    if (seen.has(n)) continue;
+    seen.add(n);
+    for (const m of adj.get(n) ?? []) stack.push(m);
+  }
+  return false;
 }
 
 export function renderMap(record, { cards = [], records = [] }, manifest, { exists, sinceVerified } = {}) {
@@ -40,8 +68,15 @@ export function renderMap(record, { cards = [], records = [] }, manifest, { exis
 
   const fwd = refEdges(record.refs);
   if (fwd.length) {
+    // The forward-ref graph, walked with a visited set: a cycle-safe probe that annotates
+    // any edge closing a loop back to this record (`↺ cycle`) instead of leaving a cycle
+    // to read as a one-way edge. Knowledge graphs legitimately cycle — the view names it.
+    const adj = refAdjacency(records);
     lines.push('→ refs');
-    for (const e of fwd) lines.push(`  ${e.rel}  ${e.curie}  ${mark(refTarget(manifest, e.curie), known, exists)}`);
+    for (const e of fwd) {
+      const cyclic = record.curie && reaches(adj, e.curie, record.curie);
+      lines.push(`  ${e.rel}  ${e.curie}  ${mark(refTarget(manifest, e.curie), known, exists)}${cyclic ? '  ↺ cycle' : ''}`);
+    }
     lines.push('');
   }
 
@@ -136,6 +171,15 @@ export function renderCuration(records, cards, events, { churn } = {}) {
   const footprints = recordFootprints(records, cards, events);
   const churnOf = typeof churn === 'function' ? churn : (c) => churn?.[c];
 
+  // Shape decay (note:append-drift) — a compact per-record signal count, folded in as a
+  // trailing annotation. Churn REMAINS the only sort; this is advisory colour, not a rank.
+  // Degrade silently: no bodies/appends loaded → zero findings → no annotation, no crash.
+  const shapeCount = new Map();
+  try {
+    const accretion = foldAccretion(events); // the fold owns accretion; lintShape stays pure
+    for (const f of lintShape(records, { accretion })) shapeCount.set(f.ref, (shapeCount.get(f.ref) ?? 0) + 1);
+  } catch { /* annotation is best-effort — never let it break the read-model */ }
+
   const rows = [];
   for (const r of records) {
     if (!r.curie) continue;
@@ -157,6 +201,7 @@ export function renderCuration(records, cards, events, { churn } = {}) {
       size,
       orphan,
       churn: Number.isFinite(c) ? c : null,
+      shape: shapeCount.get(r.curie) ?? 0,
     });
   }
 
@@ -166,9 +211,10 @@ export function renderCuration(records, cards, events, { churn } = {}) {
   const noFootprint = rows.filter((r) => !r.size).sort((a, b) => (a.curie < b.curie ? -1 : 1));
 
   const verifiedCell = (v) => (v ? (v.startsWith('git:') ? `git:${v.slice(4, 11)}` : v) : '—');
-  const row = (r) => `| ${r.curie} | ${verifiedCell(r.verified)} | ${r.churn == null ? 'n/a' : r.churn} | ${r.revised ?? '—'} | ${r.size} | ${r.orphan ? 'orphan' : ''} |`;
+  const shapeCell = (n) => (n ? `⚠${n} shape` : '');
+  const row = (r) => `| ${r.curie} | ${verifiedCell(r.verified)} | ${r.churn == null ? 'n/a' : r.churn} | ${r.revised ?? '—'} | ${r.size} | ${r.orphan ? 'orphan' : ''} | ${shapeCell(r.shape)} |`;
   const table = (rs) => (rs.length
-    ? ['| record | verified | churn | revised | footprint | orphan |', '| --- | --- | --- | --- | --- | --- |', ...rs.map(row)]
+    ? ['| record | verified | churn | revised | footprint | orphan | shape |', '| --- | --- | --- | --- | --- | --- | --- |', ...rs.map(row)]
     : ['(none)']);
 
   const lines = [

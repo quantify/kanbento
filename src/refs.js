@@ -1,4 +1,5 @@
 import { typeDef, stageById } from './manifest.js';
+import { summary } from './kernel.js';
 
 // Typed references between cards/records, as CURIEs — compact `type:slug` ids —
 // stored under a node's `payload.refs` map (`{ about: [...], implements: [...] }`).
@@ -161,11 +162,15 @@ export function checkRelationStrict(manifest, rel, targetType, existingCount = 0
 
 // Build a payload.refs map from --rel pairs. A pair splits on the FIRST `=`
 // when present (about=note:core-design — aligns with --lane and keeps the
-// CURIE's colons intact), else on the FIRST colon (about:note:core-design, the
-// original form). The relation key is open vocabulary — no key is privileged.
-// Throws on a malformed CURIE, so capture fails loudly rather than storing a
-// dangling string — with a hint when the pair was likely a bare CURIE missing
-// its relation key.
+// CURIE's colons intact), else on the FIRST colon (about:note:core-design /
+// parent:metrics-fold, the original form). The relation key is open vocabulary —
+// no key is privileged. The RHS is any handle spelling the writer will resolve
+// (slug, id, slug@id, CURIE, prefix) — same grammar as a verb's <ref> — not only
+// a type:slug CURIE. Callers with board context resolve bare handles to a stable
+// stored form (prefer CURIE) before write; see resolveRelTargets in commands.js.
+// Throws only on a missing key<sep>value shape or empty RHS, so capture fails
+// loudly rather than storing nothing (and without the old false "if parent:x is
+// the CURIE" hint when the operator already supplied a relation key).
 export function refsFromArgs(relPairs) {
   const refs = {};
   for (const p of relPairs ?? []) {
@@ -174,17 +179,12 @@ export function refsFromArgs(relPairs) {
     const i = eq > 0 ? eq : str.indexOf(':');
     // A --rel token must carry a key<sep>value shape. A bare word here almost always
     // means the variadic --rel swallowed a following positional token — name it and
-    // teach the fix rather than blaming a "malformed CURIE".
-    if (i <= 0) throw new Error(`refs: --rel "${p}" is not a key=type:slug pair (e.g. advances=capability:x · evidence=strategy:y · about=note:z) — --rel is variadic and likely swallowed following text; put positional text before --rel, or pass --rel last`);
+    // teach the fix rather than blaming a "malformed reference".
+    if (i <= 0) throw new Error(`refs: --rel "${p}" is not a key=<ref> pair (e.g. advances=capability:x · parent=metrics-fold · about=note:z) — --rel is variadic and likely swallowed following text; put positional text before --rel, or pass --rel last`);
     const rel = str.slice(0, i).trim();
-    const curie = str.slice(i + 1).trim();
-    if (!parseCurie(curie)) {
-      const hint = !curie.includes(':') && parseCurie(`${rel}:${curie}`)
-        ? ` — if "${rel}:${curie}" is the CURIE, it needs a relation key first: <key>=${rel}:${curie}`
-        : '';
-      throw new Error(`refs: "${curie}" is not a type:slug reference${hint}`);
-    }
-    (refs[rel] ??= []).push(curie);
+    const value = str.slice(i + 1).trim();
+    if (!rel || !value) throw new Error(`refs: --rel "${p}" is not a key=<ref> pair — the target is empty; pass key=<ref> (slug, id, CURIE, or prefix)`);
+    (refs[rel] ??= []).push(value);
   }
   return Object.keys(refs).length ? refs : undefined;
 }
@@ -209,7 +209,7 @@ export function collectBacklinks({ cards = [], records = [] }, targetCurie, { re
       total++;
     }
   };
-  for (const c of cards) consider({ kind: 'card', ref: c.id, title: c.title, type: c.type, state: c.state, refs: c.refs });
+  for (const c of cards) consider({ kind: 'card', ref: c.id, title: summary(c), type: c.type, state: c.state, refs: c.refs });
   for (const r of records) {
     if (cardIdentities.has(r.identity)) continue;
     consider({ kind: 'record', ref: r.path, title: r.title, type: r.type, state: r.status, refs: r.refs }); // a record's "state" is its status
@@ -264,7 +264,7 @@ export function neighborhood({ cards = [], records = [] }, manifest, startCurie,
     fwd.set(key, edges);
     for (const e of edges) (inv.get(e.curie) ?? inv.set(e.curie, []).get(e.curie)).push({ key, rel: e.rel });
   };
-  for (const c of cards) addNode(c.id, { kind: 'card', title: c.title, type: c.type }, c.refs);
+  for (const c of cards) addNode(c.id, { kind: 'card', title: summary(c), type: c.type }, c.refs);
   for (const r of records) addNode(r.curie, { kind: 'record', title: r.title, type: r.type }, r.refs);
 
   const visited = new Set([startCurie]);
